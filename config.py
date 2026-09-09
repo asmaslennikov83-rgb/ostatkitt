@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-
 from dotenv import load_dotenv
-
 
 load_dotenv()
 
@@ -23,6 +21,8 @@ class Cabinet:
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+WB_AGENT_URL = os.getenv("WB_AGENT_URL", "").strip().rstrip("/")
+WB_AGENT_SECRET = os.getenv("WB_AGENT_SECRET", "").strip()
 
 CABINETS = {
     "cab1": Cabinet(
@@ -41,8 +41,7 @@ WB_DEST = os.getenv("WB_DEST", "-1257786").strip()
 WB_CURRENCY = os.getenv("WB_CURRENCY", "rub").strip()
 WB_APP_TYPE = env_int("WB_APP_TYPE", 1)
 WB_SPP = env_int("WB_SPP", 30)
-WB_STOREFRONT_PROXY = os.getenv("WB_STOREFRONT_PROXY", "").strip()
-HTTP_TIMEOUT_SECONDS = env_int("HTTP_TIMEOUT_SECONDS", 45)
+HTTP_TIMEOUT_SECONDS = env_int("HTTP_TIMEOUT_SECONDS", 60)
 
 ALLOWED_TELEGRAM_USER_IDS = {
     int(x.strip())
@@ -52,10 +51,7 @@ ALLOWED_TELEGRAM_USER_IDS = {
 
 CONTROL_NM_IDS = [
     int(x.strip())
-    for x in os.getenv(
-        "CONTROL_NM_IDS",
-        "16358648,219205510,206008365",
-    ).split(",")
+    for x in os.getenv("CONTROL_NM_IDS", "16358648,219205510,206008365").split(",")
     if x.strip().isdigit()
 ]
 
@@ -74,13 +70,15 @@ for pair in os.getenv(
 
 
 def validate() -> None:
-    errors = []
+    missing = []
     if not TELEGRAM_BOT_TOKEN:
-        errors.append("TELEGRAM_BOT_TOKEN")
-    for cabinet in CABINETS.values():
-        if not cabinet.token:
-            errors.append(f"WB token: {cabinet.name}")
-    if errors:
-        raise RuntimeError(
-            "Не заполнены обязательные настройки .env: " + ", ".join(errors)
-        )
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not WB_AGENT_URL:
+        missing.append("WB_AGENT_URL")
+    if not WB_AGENT_SECRET:
+        missing.append("WB_AGENT_SECRET")
+    for cab in CABINETS.values():
+        if not cab.token:
+            missing.append(f"WB token: {cab.name}")
+    if missing:
+        raise RuntimeError("Не заполнены настройки .env: " + ", ".join(missing))
