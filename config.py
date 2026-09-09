@@ -41,6 +41,7 @@ WB_DEST = os.getenv("WB_DEST", "-1257786").strip()
 WB_CURRENCY = os.getenv("WB_CURRENCY", "rub").strip()
 WB_APP_TYPE = env_int("WB_APP_TYPE", 1)
 WB_SPP = env_int("WB_SPP", 30)
+WB_STOREFRONT_PROXY = os.getenv("WB_STOREFRONT_PROXY", "").strip()
 HTTP_TIMEOUT_SECONDS = env_int("HTTP_TIMEOUT_SECONDS", 45)
 
 ALLOWED_TELEGRAM_USER_IDS = {
