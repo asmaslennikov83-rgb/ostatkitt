@@ -11,6 +11,82 @@ def _priority_key(item: tuple[Warehouse, int]) -> tuple[int, str, int]:
     return (-sales, wh.cabinet_name.lower(), wh.warehouse_id)
 
 
+def _balanced_no_sales_order(candidates: list[tuple[Warehouse, int]]) -> list[tuple[Warehouse, int]]:
+    """Interleave warehouses by cabinet instead of exhausting one cabinet first.
+
+    This is used when there is no sales history. Example: with two cabinets
+    A=[A1,A2,A3] and B=[B1,B2], the order becomes A1,B1,A2,B2,A3.
+    """
+    by_cabinet: dict[str, list[tuple[Warehouse, int]]] = defaultdict(list)
+    cabinet_names: dict[str, str] = {}
+    for item in candidates:
+        wh, _sales = item
+        by_cabinet[wh.cabinet_key].append(item)
+        cabinet_names[wh.cabinet_key] = wh.cabinet_name.lower()
+
+    cabinet_keys = sorted(by_cabinet, key=lambda key: (cabinet_names[key], key))
+    for key in cabinet_keys:
+        by_cabinet[key].sort(key=lambda item: (item[0].warehouse_id, item[0].name.lower()))
+
+    result: list[tuple[Warehouse, int]] = []
+    level = 0
+    while True:
+        added = False
+        for key in cabinet_keys:
+            rows = by_cabinet[key]
+            if level < len(rows):
+                result.append(rows[level])
+                added = True
+        if not added:
+            break
+        level += 1
+    return result
+
+
+def _scarce_stock_order(candidates: list[tuple[Warehouse, int]]) -> list[tuple[Warehouse, int]]:
+    """Order candidates when stock is insufficient for every warehouse.
+
+    1. If there are no sales at all, alternate cabinets.
+    2. If sales exist, first keep cabinet coverage (best warehouse of each
+       cabinet), then use sales priority for the rest. This prevents a SKU from
+       disappearing completely from another cabinet merely because its recent
+       sales are zero.
+    """
+    total_sales = sum(sales for _wh, sales in candidates)
+    if total_sales == 0:
+        return _balanced_no_sales_order(candidates)
+
+    by_cabinet: dict[str, list[tuple[Warehouse, int]]] = defaultdict(list)
+    for item in candidates:
+        by_cabinet[item[0].cabinet_key].append(item)
+
+    cabinet_groups: list[tuple[int, str, str, list[tuple[Warehouse, int]]]] = []
+    for cabinet_key, items in by_cabinet.items():
+        items.sort(key=_priority_key)
+        cabinet_sales = sum(sales for _wh, sales in items)
+        cabinet_name = items[0][0].cabinet_name.lower()
+        cabinet_groups.append((-cabinet_sales, cabinet_name, cabinet_key, items))
+    cabinet_groups.sort()
+
+    result: list[tuple[Warehouse, int]] = []
+    used: set[tuple[str, int]] = set()
+
+    # One strongest warehouse from every cabinet first.
+    for _neg_sales, _name, _key, items in cabinet_groups:
+        first = items[0]
+        result.append(first)
+        used.add((first[0].cabinet_key, first[0].warehouse_id))
+
+    # Then remaining warehouses strictly by demand.
+    rest = [
+        item for item in candidates
+        if (item[0].cabinet_key, item[0].warehouse_id) not in used
+    ]
+    rest.sort(key=_priority_key)
+    result.extend(rest)
+    return result
+
+
 def distribute_barcode(
     barcode: str,
     quantity: int,
@@ -40,9 +116,13 @@ def distribute_barcode(
     candidates.sort(key=_priority_key)
     allocations: dict[tuple[str, int], int] = {(wh.cabinet_key, wh.warehouse_id): 0 for wh, _ in candidates}
 
-    # Если товара меньше, чем складов: по 1 шт. складам с наибольшим спросом.
+    # Если товара меньше, чем складов, нельзя дать по 1 шт. всем.
+    # Важно не "съедать" весь дефицит первым кабинетом:
+    # без истории чередуем кабинеты; при наличии истории сначала сохраняем
+    # присутствие хотя бы в каждом кабинете, затем идём по спросу.
     if quantity < len(candidates):
-        for wh, _sales in candidates[:quantity]:
+        scarce_order = _scarce_stock_order(candidates)
+        for wh, _sales in scarce_order[:quantity]:
             allocations[(wh.cabinet_key, wh.warehouse_id)] = 1
         line.allocations = allocations
         return line
@@ -56,15 +136,22 @@ def distribute_barcode(
     total_sales = sum(sales for _wh, sales in candidates)
 
     if total_sales == 0:
-        # Нет истории: доводим каждый склад до 2 шт., пока хватает.
+        # Нет истории: доводим каждый склад до целевого минимума, но также
+        # чередуем кабинеты, чтобы дополнительные единицы не ушли только
+        # в первый кабинет.
         target = max(1, no_sales_target)
         if target > 1:
-            for wh, _sales in candidates:
+            balanced = _balanced_no_sales_order(candidates)
+            for _level in range(1, target):
+                for wh, _sales in balanced:
+                    if remaining <= 0:
+                        break
+                    key = (wh.cabinet_key, wh.warehouse_id)
+                    if allocations[key] < target:
+                        allocations[key] += 1
+                        remaining -= 1
                 if remaining <= 0:
                     break
-                add = min(target - allocations[(wh.cabinet_key, wh.warehouse_id)], remaining)
-                allocations[(wh.cabinet_key, wh.warehouse_id)] += add
-                remaining -= add
         line.reserve_qty = remaining
         line.allocations = allocations
         return line
