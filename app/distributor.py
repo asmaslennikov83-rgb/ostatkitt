@@ -87,6 +87,47 @@ def _scarce_stock_order(candidates: list[tuple[Warehouse, int]]) -> list[tuple[W
     return result
 
 
+
+def _enforce_minimum_presence(
+    allocations: dict[tuple[str, int], int],
+    candidates: list[tuple[Warehouse, int]],
+    quantity: int,
+) -> dict[tuple[str, int], int]:
+    """Hard safety rule: when stock is sufficient, every available FBS warehouse gets >=1.
+
+    This runs after the normal demand-based calculation and repairs any zero
+    allocation by moving one unit from a warehouse that has more than one.
+    Total allocated quantity does not increase.
+    """
+    if quantity < len(candidates) or not candidates:
+        return allocations
+
+    candidate_keys = [(wh.cabinet_key, wh.warehouse_id) for wh, _sales in candidates]
+    zero_keys = [key for key in candidate_keys if allocations.get(key, 0) <= 0]
+    if not zero_keys:
+        return allocations
+
+    # Prefer taking units from the largest allocations first.
+    for zero_key in zero_keys:
+        donors = sorted(
+            (
+                (key, allocations.get(key, 0))
+                for key in candidate_keys
+                if allocations.get(key, 0) > 1
+            ),
+            key=lambda item: (-item[1], item[0][0], item[0][1]),
+        )
+        if not donors:
+            # Should be impossible when quantity >= number of candidates,
+            # but leave an explicit guard instead of silently creating stock.
+            break
+        donor_key, _donor_qty = donors[0]
+        allocations[donor_key] -= 1
+        allocations[zero_key] = 1
+
+    return allocations
+
+
 def distribute_barcode(
     barcode: str,
     quantity: int,
@@ -153,6 +194,7 @@ def distribute_barcode(
                 if remaining <= 0:
                     break
         line.reserve_qty = remaining
+        allocations = _enforce_minimum_presence(allocations, candidates, quantity)
         line.allocations = allocations
         return line
 
@@ -184,5 +226,6 @@ def distribute_barcode(
             # Более 20 шт.: дробный хвост оставляем в физическом резерве.
             line.reserve_qty = leftover
 
+    allocations = _enforce_minimum_presence(allocations, candidates, quantity)
     line.allocations = allocations
     return line
