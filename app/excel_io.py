@@ -59,19 +59,27 @@ def write_warehouse_files(
     output_dir: Path,
     warehouses: list[Warehouse],
     lines: list[DistributionLine],
+    all_barcodes_by_cabinet: dict[str, set[str]],
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     files: list[Path] = []
 
-    by_wh: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    # Положительные распределения по конкретному складу.
+    by_wh: dict[tuple[str, int], dict[str, int]] = {}
     for line in lines:
         for key, qty in line.allocations.items():
             if qty > 0:
-                by_wh.setdefault(key, []).append((line.barcode, qty))
+                by_wh.setdefault(key, {})[line.barcode] = qty
 
     for wh in warehouses:
-        rows = by_wh.get((wh.cabinet_key, wh.warehouse_id), [])
-        # Создаём файл даже если строк нет — так пользователь видит все созданные FBS-склады.
+        allocated = by_wh.get((wh.cabinet_key, wh.warehouse_id), {})
+
+        # ВАЖНО: WB не обнуляет позиции, отсутствующие в загружаемом файле.
+        # Поэтому каждый файл склада содержит ВСЕ доступные баркоды кабинета:
+        # распределённым ставим рассчитанный остаток, всем остальным — 0.
+        catalog_barcodes = set(all_barcodes_by_cabinet.get(wh.cabinet_key, set()))
+        all_rows = catalog_barcodes | set(allocated)
+
         filename = f"{safe_filename(wh.cabinet_name)} — {safe_filename(wh.name)}.xlsx"
         target = output_dir / filename
         shutil.copy2(template_path, target)
@@ -81,8 +89,8 @@ def write_warehouse_files(
         # Очищаем данные ниже заголовка, сохраняя шаблон.
         if ws.max_row > 1:
             ws.delete_rows(2, ws.max_row - 1)
-        for barcode, qty in sorted(rows, key=lambda x: x[0]):
-            ws.append([barcode, qty])
+        for barcode in sorted(all_rows):
+            ws.append([barcode, int(allocated.get(barcode, 0))])
         wb.save(target)
         files.append(target)
     return files

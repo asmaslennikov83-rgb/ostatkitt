@@ -99,7 +99,17 @@ class DistributionService:
             if total_sales == 0:
                 no_sales.append(barcode)
 
-        files = write_warehouse_files(self.template_path, output_dir, warehouses, lines)
+        all_barcodes_by_cabinet = {
+            cabinet_key: set(barcode_map.keys())
+            for cabinet_key, barcode_map in variants_by_cabinet.items()
+        }
+        files = write_warehouse_files(
+            self.template_path,
+            output_dir,
+            warehouses,
+            lines,
+            all_barcodes_by_cabinet,
+        )
         summary = build_summary(lines, len(files), no_sales, not_found)
 
         report = {
