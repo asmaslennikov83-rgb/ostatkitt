@@ -64,17 +64,19 @@ def write_warehouse_files(
     output_dir.mkdir(parents=True, exist_ok=True)
     files: list[Path] = []
 
-    # Положительные распределения по конкретному складу.
+    # Суммируем, а не перезаписываем: баркод комплекта теоретически может
+    # одновременно присутствовать и как готовый физический товар во входном файле.
     by_wh: dict[tuple[str, int], dict[str, int]] = {}
     for line in lines:
         for key, qty in line.allocations.items():
             if qty > 0:
-                by_wh.setdefault(key, {})[line.barcode] = qty
+                bucket = by_wh.setdefault(key, {})
+                bucket[line.barcode] = bucket.get(line.barcode, 0) + int(qty)
 
     for wh in warehouses:
         allocated = by_wh.get((wh.cabinet_key, wh.warehouse_id), {})
 
-        # ВАЖНО: WB не обнуляет позиции, отсутствующие в загружаемом файле.
+        # WB не обнуляет позиции, отсутствующие в загружаемом файле.
         # Поэтому каждый файл склада содержит ВСЕ доступные баркоды кабинета:
         # распределённым ставим рассчитанный остаток, всем остальным — 0.
         catalog_barcodes = set(all_barcodes_by_cabinet.get(wh.cabinet_key, set()))
@@ -86,7 +88,6 @@ def write_warehouse_files(
         wb = load_workbook(target)
         ws = wb.active
         ws.title = "Остатки"
-        # Очищаем данные ниже заголовка, сохраняя шаблон.
         if ws.max_row > 1:
             ws.delete_rows(2, ws.max_row - 1)
         for barcode in sorted(all_rows):
@@ -96,13 +97,28 @@ def write_warehouse_files(
     return files
 
 
-def build_summary(lines: list[DistributionLine], output_files: int, no_sales: list[str], not_found: list[str]) -> RunSummary:
+def build_summary(
+    lines: list[DistributionLine],
+    output_files: int,
+    no_sales: list[str],
+    not_found: list[str],
+    no_sales_kits: list[str],
+    not_found_kits: list[str],
+    physical_input_units: int,
+) -> RunSummary:
     summary = RunSummary()
-    summary.input_lines = len(lines)
-    summary.input_units = sum(x.source_qty for x in lines)
-    summary.allocated_units = sum(sum(x.allocations.values()) for x in lines)
-    summary.reserve_units = sum(x.reserve_qty for x in lines)
+    single_lines = [x for x in lines if not x.is_kit]
+    kit_lines = [x for x in lines if x.is_kit]
+    summary.input_lines = len(single_lines)
+    summary.input_units = physical_input_units
+    summary.reserve_units = sum(x.reserve_qty for x in single_lines)
+    summary.allocated_units = max(0, summary.input_units - summary.reserve_units)
+    summary.output_units = sum(sum(x.allocations.values()) for x in lines)
+    summary.kit_units = sum(sum(x.allocations.values()) for x in kit_lines)
+    summary.kit_skus = sum(1 for x in kit_lines if sum(x.allocations.values()) > 0)
     summary.output_files = output_files
     summary.no_sales_barcodes = no_sales
     summary.not_found_barcodes = not_found
+    summary.no_sales_kit_barcodes = no_sales_kits
+    summary.not_found_kit_barcodes = not_found_kits
     return summary
