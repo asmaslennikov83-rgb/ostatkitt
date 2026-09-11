@@ -10,6 +10,7 @@ import aiohttp
 
 from .config import Settings
 from .distributor import distribute_barcode
+from .models import DistributionLine
 from .excel_io import build_summary, read_input_xlsx, write_warehouse_files
 from .history import cleanup_history, make_run_dir, write_json
 from .wb_api import WBClient, count_orders_by_variant_and_warehouse
@@ -71,6 +72,12 @@ class DistributionService:
         no_sales: list[str] = []
 
         for barcode, qty in stock.items():
+            # Нулевой остаток не требует распределения и не должен попадать
+            # ни в «не найдено», ни в «без истории заказов».
+            if qty <= 0:
+                lines.append(DistributionLine(barcode=barcode, source_qty=qty))
+                continue
+
             line = distribute_barcode(
                 barcode=barcode,
                 quantity=qty,
