@@ -69,7 +69,7 @@ async def choose_distribution(message: Message):
         return
     user_modes[message.from_user.id] = "distribution"
     await message.answer(
-        "📦 Пришлите Excel-файл (.xlsx) с двумя колонками: «Баркод» и «Количество».\n\n"
+        "📦 Пришлите Excel-файл (.xlsx или .xls) с двумя колонками: «Код» и «Доступно».\nСтарые названия «Баркод» и «Количество» тоже поддерживаются.\n\n"
         "При распределении я учту актуальный шаблон комплектов.",
         reply_markup=main_menu(),
     )
@@ -82,7 +82,7 @@ async def choose_kits(message: Message):
         return
     user_modes[message.from_user.id] = "kits"
     await message.answer(
-        "🧩 Пришлите новый Excel-шаблон комплектов (.xlsx).\n\n"
+        "🧩 Пришлите новый Excel-шаблон комплектов (.xlsx или .xls).\n\n"
         "Нужны колонки: «Название», «баркод комплекта», «баркод1», «баркод2» и далее. "
         "Одинаковые баркоды в одной строке означают кратность компонента.\n\n"
         "После успешной загрузки этот шаблон будет использоваться до следующего обновления.",
@@ -116,8 +116,8 @@ async def document_handler(message: Message, bot: Bot):
 
     doc = message.document
     filename = (doc.file_name or "").lower()
-    if not filename.endswith(".xlsx"):
-        await message.answer("Нужен файл Excel в формате .xlsx", reply_markup=main_menu())
+    if not filename.endswith((".xlsx", ".xls")):
+        await message.answer("Нужен файл Excel в формате .xlsx или .xls", reply_markup=main_menu())
         return
 
     mode = user_modes.get(message.from_user.id)
@@ -132,7 +132,7 @@ async def document_handler(message: Message, bot: Bot):
         status = await message.answer("⏳ Проверяю и сохраняю шаблон комплектов…")
         try:
             with tempfile.TemporaryDirectory(prefix="wb_kits_") as tmp:
-                local_path = Path(tmp) / "kits.xlsx"
+                local_path = Path(tmp) / ("kits.xls" if filename.endswith(".xls") else "kits.xlsx")
                 file = await bot.get_file(doc.file_id)
                 await bot.download_file(file.file_path, destination=local_path)
                 count = service.update_kits_template(local_path)
@@ -152,7 +152,7 @@ async def document_handler(message: Message, bot: Bot):
     status = await message.answer("⏳ Получил остатки. Проверяю WB, комплекты и распределяю товар…")
     try:
         with tempfile.TemporaryDirectory(prefix="wb_fbs_") as tmp:
-            local_path = Path(tmp) / "input.xlsx"
+            local_path = Path(tmp) / ("input.xls" if filename.endswith(".xls") else "input.xlsx")
             file = await bot.get_file(doc.file_id)
             await bot.download_file(file.file_path, destination=local_path)
 
@@ -170,7 +170,8 @@ async def document_handler(message: Message, bot: Bot):
                 f"Одиночных ШК без истории заказов: {len(summary.no_sales_barcodes)}\n"
                 f"Одиночных ШК не найдены в WB: {len(summary.not_found_barcodes)}\n"
                 f"Комплектов без истории заказов: {len(summary.no_sales_kit_barcodes)}\n"
-                f"Комплектов не найдены в WB: {len(summary.not_found_kit_barcodes)}"
+                f"Комплектов не найдены в WB: {len(summary.not_found_kit_barcodes)}\n"
+                f"ШК пропущено по !: {len(summary.excluded_barcodes)}"
             )
             await status.edit_text(text)
 

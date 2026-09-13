@@ -9,33 +9,69 @@ from openpyxl import load_workbook
 from .models import DistributionLine, RunSummary, Warehouse
 
 
-BARCODE_HEADERS = {"баркод", "штрихкод", "barcode", "шк"}
-QTY_HEADERS = {"количество", "кол-во", "qty", "quantity", "остаток"}
+BARCODE_HEADERS = {"код", "баркод", "штрихкод", "barcode", "шк"}
+QTY_HEADERS = {"доступно", "количество", "кол-во", "qty", "quantity", "остаток"}
 
 
 def _norm(value) -> str:
     return str(value or "").strip().lower().replace("ё", "е")
 
 
-def read_input_xlsx(path: Path) -> dict[str, int]:
-    wb = load_workbook(path, read_only=True, data_only=True)
-    ws = wb.active
-    headers = {_norm(ws.cell(1, col).value): col for col in range(1, ws.max_column + 1)}
-    barcode_col = next((headers[h] for h in BARCODE_HEADERS if h in headers), None)
-    qty_col = next((headers[h] for h in QTY_HEADERS if h in headers), None)
-    if not barcode_col or not qty_col:
-        raise ValueError("В файле должны быть две колонки: Баркод и Количество")
+def _iter_input_rows(path: Path):
+    suffix = path.suffix.lower()
+    if suffix == ".xlsx":
+        wb = load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        headers = [_norm(ws.cell(1, col).value) for col in range(1, ws.max_column + 1)]
+        yield headers
+        for row in range(2, ws.max_row + 1):
+            yield [ws.cell(row, col).value for col in range(1, ws.max_column + 1)]
+        return
+    if suffix == ".xls":
+        import xlrd
+        wb = xlrd.open_workbook(path)
+        ws = wb.sheet_by_index(0)
+        if ws.nrows == 0:
+            return
+        yield [_norm(ws.cell_value(0, col)) for col in range(ws.ncols)]
+        for row in range(1, ws.nrows):
+            yield [ws.cell_value(row, col) for col in range(ws.ncols)]
+        return
+    raise ValueError("Поддерживаются только файлы .xlsx и .xls")
+
+
+def read_input_excel(path: Path) -> tuple[dict[str, int], set[str]]:
+    rows = iter(_iter_input_rows(path))
+    try:
+        headers = next(rows)
+    except StopIteration:
+        raise ValueError("Файл пустой")
+
+    barcode_col = next((i for i, h in enumerate(headers) if h in BARCODE_HEADERS), None)
+    qty_col = next((i for i, h in enumerate(headers) if h in QTY_HEADERS), None)
+    if barcode_col is None or qty_col is None:
+        raise ValueError(
+            "В файле должны быть две колонки: «Код» и «Доступно» "
+            "(также поддерживаются старые «Баркод» и «Количество»)"
+        )
 
     result: dict[str, int] = {}
-    for row in range(2, ws.max_row + 1):
-        barcode_raw = ws.cell(row, barcode_col).value
-        qty_raw = ws.cell(row, qty_col).value
-        if barcode_raw is None and qty_raw is None:
+    excluded: set[str] = set()
+    for values in rows:
+        barcode_raw = values[barcode_col] if barcode_col < len(values) else None
+        qty_raw = values[qty_col] if qty_col < len(values) else None
+        if barcode_raw in (None, "") and qty_raw in (None, ""):
             continue
         barcode = str(barcode_raw or "").strip()
         if barcode.endswith(".0") and barcode[:-2].isdigit():
             barcode = barcode[:-2]
         if not barcode:
+            continue
+        if str(qty_raw or "").strip() == "!":
+            excluded.add(barcode)
+            result.pop(barcode, None)
+            continue
+        if barcode in excluded:
             continue
         try:
             qty = int(float(qty_raw or 0))
@@ -44,9 +80,14 @@ def read_input_xlsx(path: Path) -> dict[str, int]:
         if qty < 0:
             raise ValueError(f"Количество не может быть отрицательным: ШК {barcode}")
         result[barcode] = result.get(barcode, 0) + qty
-    if not result:
+    if not result and not excluded:
         raise ValueError("В файле нет строк с остатками")
-    return result
+    return result, excluded
+
+
+# Обратная совместимость для внутренних импортов старых версий.
+def read_input_xlsx(path: Path) -> tuple[dict[str, int], set[str]]:
+    return read_input_excel(path)
 
 
 def safe_filename(value: str) -> str:
@@ -105,6 +146,7 @@ def build_summary(
     no_sales_kits: list[str],
     not_found_kits: list[str],
     physical_input_units: int,
+    excluded_barcodes: set[str] | None = None,
 ) -> RunSummary:
     summary = RunSummary()
     single_lines = [x for x in lines if not x.is_kit]
@@ -121,4 +163,5 @@ def build_summary(
     summary.not_found_barcodes = not_found
     summary.no_sales_kit_barcodes = no_sales_kits
     summary.not_found_kit_barcodes = not_found_kits
+    summary.excluded_barcodes = sorted(excluded_barcodes or set())
     return summary

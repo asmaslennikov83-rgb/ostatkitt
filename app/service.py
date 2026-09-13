@@ -10,9 +10,9 @@ import aiohttp
 
 from .config import Settings
 from .distributor import distribute_barcode
-from .excel_io import build_summary, read_input_xlsx, write_warehouse_files
+from .excel_io import build_summary, read_input_excel, write_warehouse_files
 from .history import cleanup_history, make_run_dir, write_json
-from .kits import read_kits_xlsx
+from .kits import read_kits_excel
 from .models import DistributionLine, KitDefinition, ProductVariant, Warehouse
 from .wb_api import WBClient, count_orders_by_variant_and_warehouse
 
@@ -32,12 +32,23 @@ class DistributionService:
     def kits_count(self) -> int:
         if not self.kits_path.exists():
             return 0
-        return len(read_kits_xlsx(self.kits_path))
+        return len(read_kits_excel(self.kits_path))
 
     def update_kits_template(self, input_path: Path) -> int:
-        kits = read_kits_xlsx(input_path)  # сначала валидируем
+        kits = read_kits_excel(input_path)  # сначала валидируем
         tmp = self.kits_path.with_suffix(".tmp.xlsx")
-        shutil.copy2(input_path, tmp)
+        if input_path.suffix.lower() == ".xlsx":
+            shutil.copy2(input_path, tmp)
+        else:
+            # Нормализуем старый XLS в XLSX для постоянного хранения.
+            from openpyxl import Workbook
+            import xlrd
+            src = xlrd.open_workbook(input_path).sheet_by_index(0)
+            wb = Workbook()
+            ws = wb.active
+            for r in range(src.nrows):
+                ws.append([src.cell_value(r, c) for c in range(src.ncols)])
+            wb.save(tmp)
         tmp.replace(self.kits_path)
         return len(kits)
 
@@ -97,12 +108,12 @@ class DistributionService:
     async def process(self, input_path: Path, user_id: int) -> dict:
         cleanup_history(self.history_root, self.settings.retention_days)
         run_dir = make_run_dir(self.history_root, user_id)
-        input_copy = run_dir / "input.xlsx"
+        input_copy = run_dir / f"input{input_path.suffix.lower()}"
         shutil.copy2(input_path, input_copy)
         output_dir = run_dir / "output"
 
-        stock = read_input_xlsx(input_copy)
-        kits: list[KitDefinition] = read_kits_xlsx(self.kits_path) if self.kits_path.exists() else []
+        stock, excluded_barcodes = read_input_excel(input_copy)
+        kits: list[KitDefinition] = read_kits_excel(self.kits_path) if self.kits_path.exists() else []
 
         connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -171,6 +182,14 @@ class DistributionService:
         no_sales_kits: list[str] = []
 
         for kit in kits:
+            # Если баркод комплекта помечен ! во входном файле, он полностью
+            # ведётся вручную и бот не должен формировать/обнулять его.
+            if kit.barcode in excluded_barcodes:
+                continue
+            # Если любой компонент набора помечен !, этот набор не формируем:
+            # ручной ШК нельзя расходовать автоматически.
+            if any(component in excluded_barcodes for component in kit.components):
+                continue
             kit_candidates = self._candidate_warehouses(kit.barcode, warehouses, variants_by_cabinet)
             if not kit_candidates:
                 not_found_kits.append(kit.barcode)
@@ -270,7 +289,7 @@ class DistributionService:
         lines = single_lines + kit_lines
 
         all_barcodes_by_cabinet = {
-            cabinet_key: set(barcode_map.keys())
+            cabinet_key: set(barcode_map.keys()) - excluded_barcodes
             for cabinet_key, barcode_map in variants_by_cabinet.items()
         }
         files = write_warehouse_files(
@@ -288,6 +307,7 @@ class DistributionService:
             no_sales_kits=no_sales_kits,
             not_found_kits=not_found_kits,
             physical_input_units=sum(stock.values()),
+            excluded_barcodes=excluded_barcodes,
         )
 
         report = {
@@ -303,6 +323,7 @@ class DistributionService:
             "not_found_barcodes": not_found,
             "no_sales_kit_barcodes": no_sales_kits,
             "not_found_kit_barcodes": not_found_kits,
+            "excluded_barcodes": sorted(excluded_barcodes),
             "component_consumed_by_kits": dict(component_consumed),
             "kits": kit_report,
             "allocations": [

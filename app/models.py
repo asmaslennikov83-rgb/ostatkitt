@@ -51,3 +51,4 @@ class RunSummary:
     not_found_barcodes: list[str] = field(default_factory=list)
     no_sales_kit_barcodes: list[str] = field(default_factory=list)
     not_found_kit_barcodes: list[str] = field(default_factory=list)
+    excluded_barcodes: list[str] = field(default_factory=list)
