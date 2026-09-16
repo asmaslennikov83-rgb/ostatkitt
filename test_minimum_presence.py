@@ -15,8 +15,8 @@ for i in range(4):
     wh = Warehouse("cabinet_2", "Кабинет 2", 200+i, f"B{i+1}")
     warehouses.append(wh)
 
-variants["cabinet_1"][barcode] = ProductVariant(chrt_id=chrt, nm_id=1, skus=(barcode,))
-variants["cabinet_2"][barcode] = ProductVariant(chrt_id=chrt, nm_id=1, skus=(barcode,))
+variants["cabinet_1"][barcode] = ProductVariant("cabinet_1", chrt, 1, (barcode,))
+variants["cabinet_2"][barcode] = ProductVariant("cabinet_2", chrt, 1, (barcode,))
 
 # All demand on a single warehouse: minimum 1 must still remain everywhere.
 orders["cabinet_1"][(chrt, 100)] = 100
