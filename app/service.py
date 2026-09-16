@@ -20,13 +20,15 @@ from .wb_api import WBClient, count_orders_by_variant_and_warehouse
 def _kit_target_sets(possible_sets: int, sales_14d: int, warehouse_count: int, safety_stock_per_warehouse: int = 4) -> int:
     """Return how many kits should actually be built.
 
-    Demand is capped by 14-day orders, while preserving minimum presence of
-    one kit per available FBS warehouse whenever components are sufficient.
-    Physical availability always has the final say.
+    Kits are capped by their 14-day demand. For presence, we aim for at least
+    one kit per available FBS warehouse when components allow. The single-item
+    safety stock (2..4 units) is replenished only *after* kits are formed, so it
+    must not block kit creation. ``safety_stock_per_warehouse`` is kept in the
+    signature for backward compatibility but does not multiply kit presence.
     """
     if possible_sets <= 0 or warehouse_count <= 0:
         return 0
-    minimum_presence = int(warehouse_count) * max(1, int(safety_stock_per_warehouse))
+    minimum_presence = int(warehouse_count)
     demand_target = max(int(sales_14d), minimum_presence)
     return min(int(possible_sets), demand_target)
 
@@ -323,9 +325,11 @@ class DistributionService:
         }
         diagnostic["merged_input_aliases"] = merged_input_aliases
 
-        # --- Фаза 1. Резервируем обязательный минимум одиночного товара. ---
-        # Это и есть приоритет одиночного товара: комплект никогда не забирает
-        # единицы, необходимые для 1 шт. одиночного SKU на каждый доступный склад.
+        # --- Фаза 1. Резервируем только базовый минимум одиночного товара. ---
+        # Приоритет одиночного товара означает: сначала защищаем 1 шт. на каждый
+        # доступный FBS-склад. Страховой запас 2..4 шт. поднимается ПОСЛЕ
+        # формирования комплектов, иначе небольшой остаток полностью блокировал
+        # бы комплекты (например 16 шт. компонента на 10 складах).
         reserved_for_single: dict[str, int] = {}
         kit_available: dict[str, int] = {}
         for barcode, qty in stock.items():
@@ -334,7 +338,7 @@ class DistributionService:
                 kit_available[barcode] = 0
                 continue
             candidates = self._candidate_warehouses(barcode, warehouses, variants_by_cabinet)
-            minimum = min(qty, len(candidates) * self.settings.safety_stock_per_warehouse) if candidates else 0
+            minimum = min(qty, len(candidates)) if candidates else 0
             reserved_for_single[barcode] = minimum
             kit_available[barcode] = qty - minimum
 
@@ -407,9 +411,10 @@ class DistributionService:
                 continue
 
             # Комплекты нельзя собирать из всего доступного остатка компонентов.
-            # Их целевое количество ограничиваем реальной потребностью за 14 дней,
-            # но одновременно сохраняем обязательное присутствие минимум по 1 шт.
-            # на каждом FBS-складе, если компонентов хватает.
+            # Их количество ограничено спросом за 14 дней, но при наличии
+            # компонентов стараемся держать хотя бы 1 комплект на каждом складе.
+            # Страховой запас 4 шт. относится к одиночному товару и поднимается
+            # только после этой фазы.
             kit_candidates = self._candidate_warehouses(kit.barcode, warehouses, variants_by_cabinet)
             minimum_presence = len(kit_candidates)
             target_sets = _kit_target_sets(max_sets, sales, minimum_presence, self.settings.safety_stock_per_warehouse)
