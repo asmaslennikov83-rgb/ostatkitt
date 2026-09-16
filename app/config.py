@@ -41,6 +41,7 @@ class Settings:
     retention_days: int
     no_sales_target: int
     distribute_all_threshold: int
+    safety_stock_per_warehouse: int
     base_dir: Path = BASE_DIR
 
 
@@ -61,4 +62,5 @@ def load_settings() -> Settings:
         retention_days=int(os.getenv("HISTORY_RETENTION_DAYS", "4")),
         no_sales_target=int(os.getenv("NO_SALES_TARGET_PER_WAREHOUSE", "2")),
         distribute_all_threshold=int(os.getenv("DISTRIBUTE_ALL_THRESHOLD", "20")),
+        safety_stock_per_warehouse=max(1, int(os.getenv("SAFETY_STOCK_PER_WAREHOUSE", "4"))),
     )

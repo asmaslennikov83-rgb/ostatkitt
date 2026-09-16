@@ -101,6 +101,7 @@ def write_warehouse_files(
     warehouses: list[Warehouse],
     lines: list[DistributionLine],
     all_barcodes_by_cabinet: dict[str, set[str]],
+    output_barcode_by_cabinet: dict[str, dict[str, str]] | None = None,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     files: list[Path] = []
@@ -108,11 +109,19 @@ def write_warehouse_files(
     # Суммируем, а не перезаписываем: баркод комплекта теоретически может
     # одновременно присутствовать и как готовый физический товар во входном файле.
     by_wh: dict[tuple[str, int], dict[str, int]] = {}
+    output_barcode_by_cabinet = output_barcode_by_cabinet or {}
     for line in lines:
         for key, qty in line.allocations.items():
             if qty > 0:
+                cabinet_key, _warehouse_id = key
+                # Несколько ШК одного chrtID никогда не должны одновременно
+                # попадать в один файл. Перенаправляем любую аллокацию на
+                # единственный выбранный выходной ШК этой товарной вариации.
+                out_barcode = output_barcode_by_cabinet.get(cabinet_key, {}).get(
+                    line.barcode, line.barcode
+                )
                 bucket = by_wh.setdefault(key, {})
-                bucket[line.barcode] = bucket.get(line.barcode, 0) + int(qty)
+                bucket[out_barcode] = bucket.get(out_barcode, 0) + int(qty)
 
     for wh in warehouses:
         allocated = by_wh.get((wh.cabinet_key, wh.warehouse_id), {})

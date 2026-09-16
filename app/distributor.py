@@ -136,6 +136,7 @@ def distribute_barcode(
     order_counts_by_cabinet: dict[str, dict[tuple[int, int], int]],
     threshold: int,
     no_sales_target: int,
+    safety_stock_per_warehouse: int = 4,
 ) -> DistributionLine:
     line = DistributionLine(barcode=barcode, source_qty=quantity)
     if quantity <= 0:
@@ -158,9 +159,7 @@ def distribute_barcode(
     allocations: dict[tuple[str, int], int] = {(wh.cabinet_key, wh.warehouse_id): 0 for wh, _ in candidates}
 
     # Если товара меньше, чем складов, нельзя дать по 1 шт. всем.
-    # Важно не "съедать" весь дефицит первым кабинетом:
-    # без истории чередуем кабинеты; при наличии истории сначала сохраняем
-    # присутствие хотя бы в каждом кабинете, затем идём по спросу.
+    # Сохраняем покрытие кабинетов и затем идём по спросу.
     if quantity < len(candidates):
         scarce_order = _scarce_stock_order(candidates)
         for wh, _sales in scarce_order[:quantity]:
@@ -168,64 +167,74 @@ def distribute_barcode(
         line.allocations = allocations
         return line
 
-    # Обязательный минимум: 1 шт. на каждый склад.
+    # Страховой запас: стараемся равномерно поднять каждый склад до заданного
+    # минимума (по умолчанию 4 шт.) ДО распределения по продажам.
+    safety_target = max(1, int(safety_stock_per_warehouse))
     remaining = quantity
-    for wh, _sales in candidates:
-        allocations[(wh.cabinet_key, wh.warehouse_id)] = 1
-        remaining -= 1
+    balanced = _balanced_no_sales_order(candidates)
+
+    # Идём слоями: сначала 1 шт. всем, затем 2-я всем, затем 3-я и 4-я.
+    # Если товара не хватает на полный слой, при наличии продаж остаток слоя
+    # отдаём более продающим складам; без продаж сохраняем чередование кабинетов.
+    for level in range(1, safety_target + 1):
+        if remaining <= 0:
+            break
+        if remaining >= len(candidates):
+            layer_order = balanced
+            take = len(candidates)
+        else:
+            total_sales = sum(sales for _wh, sales in candidates)
+            layer_order = _scarce_stock_order(candidates) if total_sales > 0 else balanced
+            take = remaining
+        for wh, _sales in layer_order[:take]:
+            key = (wh.cabinet_key, wh.warehouse_id)
+            if allocations[key] < level:
+                allocations[key] += 1
+                remaining -= 1
+                if remaining <= 0:
+                    break
+
+    # Пока страховой минимум не закрыт полностью, весь доступный товар уже
+    # распределён и резерв создавать не нужно.
+    if remaining <= 0:
+        line.reserve_qty = 0
+        line.allocations = allocations
+        return line
 
     total_sales = sum(sales for _wh, sales in candidates)
 
     if total_sales == 0:
-        # Нет истории: доводим каждый склад до целевого минимума, но также
-        # чередуем кабинеты, чтобы дополнительные единицы не ушли только
-        # в первый кабинет.
-        target = max(1, no_sales_target)
-        if target > 1:
-            balanced = _balanced_no_sales_order(candidates)
-            for _level in range(1, target):
-                for wh, _sales in balanced:
-                    if remaining <= 0:
-                        break
-                    key = (wh.cabinet_key, wh.warehouse_id)
-                    if allocations[key] < target:
-                        allocations[key] += 1
-                        remaining -= 1
-                if remaining <= 0:
-                    break
+        # Без истории продаж сверх страхового минимума товар оставляем в резерве.
         line.reserve_qty = remaining
-        allocations = _enforce_minimum_presence(allocations, candidates, quantity)
         line.allocations = allocations
         return line
 
-    # Есть история продаж. Распределяем остаток сверх обязательного минимума пропорционально заказам.
-    if remaining > 0:
-        raw_extra: list[tuple[Warehouse, int, float, int]] = []
-        floor_sum = 0
-        for wh, sales in candidates:
-            exact = remaining * sales / total_sales
-            floored = math.floor(exact)
-            raw_extra.append((wh, sales, exact, floored))
-            allocations[(wh.cabinet_key, wh.warehouse_id)] += floored
-            floor_sum += floored
+    # Есть история продаж. Всё сверх страхового минимума распределяем
+    # пропорционально заказам.
+    raw_extra: list[tuple[Warehouse, int, float, int]] = []
+    floor_sum = 0
+    for wh, sales in candidates:
+        exact = remaining * sales / total_sales
+        floored = math.floor(exact)
+        raw_extra.append((wh, sales, exact, floored))
+        allocations[(wh.cabinet_key, wh.warehouse_id)] += floored
+        floor_sum += floored
 
-        leftover = remaining - floor_sum
+    leftover = remaining - floor_sum
 
-        if quantity <= threshold:
-            # До 20 шт. распределяем весь остаток. Сначала по максимальной дробной части,
-            # затем по продажам, затем стабильный порядок.
-            raw_extra.sort(key=lambda x: (-(x[2] - x[3]), -x[1], x[0].cabinet_name.lower(), x[0].warehouse_id))
-            i = 0
-            while leftover > 0 and raw_extra:
-                wh = raw_extra[i % len(raw_extra)][0]
-                allocations[(wh.cabinet_key, wh.warehouse_id)] += 1
-                leftover -= 1
-                i += 1
-            line.reserve_qty = 0
-        else:
-            # Более 20 шт.: дробный хвост оставляем в физическом резерве.
-            line.reserve_qty = leftover
+    if quantity <= threshold:
+        # Для небольшого остатка распределяем всё.
+        raw_extra.sort(key=lambda x: (-(x[2] - x[3]), -x[1], x[0].cabinet_name.lower(), x[0].warehouse_id))
+        i = 0
+        while leftover > 0 and raw_extra:
+            wh = raw_extra[i % len(raw_extra)][0]
+            allocations[(wh.cabinet_key, wh.warehouse_id)] += 1
+            leftover -= 1
+            i += 1
+        line.reserve_qty = 0
+    else:
+        # Для крупного остатка дробный хвост оставляем на физическом складе.
+        line.reserve_qty = leftover
 
-    allocations = _enforce_minimum_presence(allocations, candidates, quantity)
     line.allocations = allocations
     return line
