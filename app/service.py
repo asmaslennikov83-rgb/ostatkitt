@@ -17,6 +17,19 @@ from .models import DistributionLine, KitDefinition, ProductVariant, Warehouse
 from .wb_api import WBClient, count_orders_by_variant_and_warehouse
 
 
+def _kit_target_sets(possible_sets: int, sales_14d: int, warehouse_count: int) -> int:
+    """Return how many kits should actually be built.
+
+    Demand is capped by 14-day orders, while preserving minimum presence of
+    one kit per available FBS warehouse whenever components are sufficient.
+    Physical availability always has the final say.
+    """
+    if possible_sets <= 0 or warehouse_count <= 0:
+        return 0
+    demand_target = max(int(sales_14d), int(warehouse_count))
+    return min(int(possible_sets), demand_target)
+
+
 class DistributionService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -227,18 +240,30 @@ class DistributionService:
                     "name": kit.name,
                     "sales_14d": sales,
                     "possible_before_distribution": 0,
+                    "target_sets": 0,
                     "built": 0,
                     "components": dict(component_counts),
                 })
                 continue
 
+            # Комплекты нельзя собирать из всего доступного остатка компонентов.
+            # Их целевое количество ограничиваем реальной потребностью за 14 дней,
+            # но одновременно сохраняем обязательное присутствие минимум по 1 шт.
+            # на каждом FBS-складе, если компонентов хватает.
+            kit_candidates = self._candidate_warehouses(kit.barcode, warehouses, variants_by_cabinet)
+            minimum_presence = len(kit_candidates)
+            target_sets = _kit_target_sets(max_sets, sales, minimum_presence)
+
             line = distribute_barcode(
                 barcode=kit.barcode,
-                quantity=max_sets,
+                quantity=target_sets,
                 warehouses=warehouses,
                 barcode_variants_by_cabinet=variants_by_cabinet,
                 order_counts_by_cabinet=counts_by_cabinet,
-                threshold=self.settings.distribute_all_threshold,
+                # Для комплектов целевое количество уже рассчитано выше.
+                # Поэтому округлённый хвост не оставляем виртуальным резервом:
+                # распределяем весь target_sets по складам.
+                threshold=max(self.settings.distribute_all_threshold, target_sets),
                 no_sales_target=self.settings.no_sales_target,
             )
             built = sum(line.allocations.values())
@@ -260,6 +285,7 @@ class DistributionService:
                 "name": kit.name,
                 "sales_14d": sales,
                 "possible_before_distribution": max_sets,
+                "target_sets": target_sets,
                 "built": built,
                 "components": dict(component_counts),
                 "allocations": {f"{k[0]}:{k[1]}": v for k, v in line.allocations.items() if v},
