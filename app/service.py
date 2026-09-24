@@ -325,22 +325,10 @@ class DistributionService:
         }
         diagnostic["merged_input_aliases"] = merged_input_aliases
 
-        # --- Фаза 1. Резервируем только базовый минимум одиночного товара. ---
-        # Приоритет одиночного товара означает: сначала защищаем 1 шт. на каждый
-        # доступный FBS-склад. Страховой запас 2..4 шт. поднимается ПОСЛЕ
-        # формирования комплектов, иначе небольшой остаток полностью блокировал
-        # бы комплекты (например 16 шт. компонента на 10 складах).
-        reserved_for_single: dict[str, int] = {}
-        kit_available: dict[str, int] = {}
-        for barcode, qty in stock.items():
-            if qty <= 0:
-                reserved_for_single[barcode] = 0
-                kit_available[barcode] = 0
-                continue
-            candidates = self._candidate_warehouses(barcode, warehouses, variants_by_cabinet)
-            minimum = min(qty, len(candidates)) if candidates else 0
-            reserved_for_single[barcode] = minimum
-            kit_available[barcode] = qty - minimum
+        # Inventory is shared by singles and kits. Reserve only what is actually
+        # allocated; a single unit may never be counted as both a kit and a single.
+        remaining_stock = dict(stock)
+        reserved_for_single: dict[str, int] = {sku: 0 for sku in stock}
 
         not_found: list[str] = []
         no_sales: list[str] = []
@@ -383,99 +371,119 @@ class DistributionService:
             component_counts = Counter(resolved)
             valid_kits.append((kit, component_counts, sales))
 
-        # При дефиците компонентов: сначала более продаваемые комплекты,
-        # при равенстве — порядок строк в шаблоне.
-        valid_kits.sort(key=lambda x: (-x[2], x[0].row_number))
-
+        # Phase 1: allocate the mandatory safety floor to singles and kits.
+        # If a full floor is impossible, allocate whole units layer by layer;
+        # never create a kit without all of its components.
+        safety = max(1, int(self.settings.safety_stock_per_warehouse))
         kit_lines: list[DistributionLine] = []
         kit_report: list[dict] = []
         component_consumed: Counter[str] = Counter()
+        kit_built: dict[str, int] = {kit.barcode: 0 for kit, _components, _sales in valid_kits}
+        single_candidates = {
+            sku: self._candidate_warehouses(sku, warehouses, variants_by_cabinet)
+            for sku in stock
+        }
+        kit_candidates_by_sku = {
+            kit.barcode: self._candidate_warehouses(kit.barcode, warehouses, variants_by_cabinet)
+            for kit, _components, _sales in valid_kits
+        }
+        kit_component_by_sku = {kit.barcode: components for kit, components, _sales in valid_kits}
 
-        for kit, component_counts, sales in valid_kits:
-            max_sets: int | None = None
-            for component_barcode, multiplicity in component_counts.items():
-                available = kit_available.get(component_barcode, 0)
-                possible = available // multiplicity
-                max_sets = possible if max_sets is None else min(max_sets, possible)
-            max_sets = int(max_sets or 0)
-            if max_sets <= 0:
-                kit_report.append({
-                    "barcode": kit.barcode,
-                    "name": kit.name,
-                    "sales_14d": sales,
-                    "possible_before_distribution": 0,
-                    "target_sets": 0,
-                    "built": 0,
-                    "components": dict(component_counts),
-                })
-                continue
+        # Alternate between singles and kits at each safety level. A kit's
+        # minimum consumes its full BOM, including repeated component barcodes.
+        for level in range(1, safety + 1):
+            for sku in sorted(stock):
+                required = min(level * len(single_candidates[sku]), stock[sku])
+                additional = min(max(0, required - reserved_for_single[sku]), remaining_stock[sku])
+                reserved_for_single[sku] += additional
+                remaining_stock[sku] -= additional
+            for kit, components, sales in sorted(valid_kits, key=lambda x: (-x[2], x[0].row_number)):
+                desired = level * len(kit_candidates_by_sku[kit.barcode])
+                missing = max(0, desired - kit_built[kit.barcode])
+                possible = min((remaining_stock.get(sku, 0) // count for sku, count in components.items()), default=0)
+                add = min(missing, possible)
+                if add:
+                    kit_built[kit.barcode] += add
+                    for sku, count in components.items():
+                        remaining_stock[sku] -= add * count
+                        component_consumed[sku] += add * count
 
-            # Комплекты нельзя собирать из всего доступного остатка компонентов.
-            # Их количество ограничено спросом за 14 дней, но при наличии
-            # компонентов стараемся держать хотя бы 1 комплект на каждом складе.
-            # Страховой запас 4 шт. относится к одиночному товару и поднимается
-            # только после этой фазы.
-            kit_candidates = self._candidate_warehouses(kit.barcode, warehouses, variants_by_cabinet)
-            minimum_presence = len(kit_candidates)
-            target_sets = _kit_target_sets(max_sets, sales, minimum_presence, self.settings.safety_stock_per_warehouse)
+        # Phase 2: distribute the remaining physical components according to
+        # actual 14-day demand in *component units*, not kit units. This gives
+        # singles and kits proportional access to a shared component pool.
+        # Multiple kits sharing components are handled by recomputing the pool
+        # after each whole kit; tie breaks are deterministic.
+        def demand(sku: str) -> int:
+            return self._total_sales(sku, warehouses, variants_by_cabinet, counts_by_cabinet)
 
+        single_demand = {sku: demand(sku) for sku in stock}
+        # Each iteration awards one additional sellable unit to the most
+        # under-served demand stream, measured against its physical BOM cost.
+        # A zero-sales kit gets only its safety allocation.
+        while True:
+            options: list[tuple[float, int, str, str]] = []
+            for sku, qty in remaining_stock.items():
+                if qty > 0 and single_candidates[sku] and single_demand[sku] > 0:
+                    ratio = reserved_for_single[sku] / single_demand[sku]
+                    options.append((ratio, 0, sku, 'single'))
+            for kit, components, sales in valid_kits:
+                if sales <= 0 or not components:
+                    continue
+                if all(remaining_stock.get(sku, 0) >= count for sku, count in components.items()):
+                    # Do not build beyond the demand-based target except for
+                    # the already guaranteed safety floor.
+                    if kit_built[kit.barcode] < max(sales, safety * len(kit_candidates_by_sku[kit.barcode])):
+                        ratio = kit_built[kit.barcode] / sales
+                        options.append((ratio, 1, kit.barcode, 'kit'))
+            if not options:
+                break
+            _ratio, _rank, sku, kind = min(options)
+            if kind == 'single':
+                remaining_stock[sku] -= 1
+                reserved_for_single[sku] += 1
+            else:
+                kit_built[sku] += 1
+                for component, count in kit_component_by_sku[sku].items():
+                    remaining_stock[component] -= count
+                    component_consumed[component] += count
+
+        # Allocate the pre-built kits by their own warehouse demand, with a
+        # per-warehouse floor of four when enough kits exist.
+        for kit, components, sales in valid_kits:
+            built_target = kit_built[kit.barcode]
             line = distribute_barcode(
-                barcode=kit.barcode,
-                quantity=target_sets,
-                warehouses=warehouses,
+                barcode=kit.barcode, quantity=built_target, warehouses=warehouses,
                 barcode_variants_by_cabinet=variants_by_cabinet,
                 order_counts_by_cabinet=counts_by_cabinet,
-                # Для комплектов целевое количество уже рассчитано выше.
-                # Поэтому округлённый хвост не оставляем виртуальным резервом:
-                # распределяем весь target_sets по складам.
-                threshold=max(self.settings.distribute_all_threshold, target_sets),
+                threshold=max(self.settings.distribute_all_threshold, built_target),
                 no_sales_target=self.settings.no_sales_target,
-                safety_stock_per_warehouse=self.settings.safety_stock_per_warehouse,
+                safety_stock_per_warehouse=safety,
             )
             built = sum(line.allocations.values())
-            # Виртуальный резерв комплектов не строим физически: компоненты
-            # списываются только на реально выставленное количество комплектов.
             line.source_qty = 0
             line.reserve_qty = 0
             line.is_kit = True
-
-            if built > 0:
-                for component_barcode, multiplicity in component_counts.items():
-                    used = built * multiplicity
-                    kit_available[component_barcode] = max(0, kit_available.get(component_barcode, 0) - used)
-                    component_consumed[component_barcode] += used
+            if built:
                 kit_lines.append(line)
-
             kit_report.append({
-                "barcode": kit.barcode,
-                "name": kit.name,
-                "sales_14d": sales,
-                "possible_before_distribution": max_sets,
-                "target_sets": target_sets,
-                "built": built,
-                "components": dict(component_counts),
-                "allocations": {f"{k[0]}:{k[1]}": v for k, v in line.allocations.items() if v},
+                'barcode': kit.barcode, 'name': kit.name, 'sales_14d': sales,
+                'possible_before_distribution': built_target,
+                'target_sets': built_target, 'built': built,
+                'components': dict(components),
+                'allocations': {f'{k[0]}:{k[1]}': v for k, v in line.allocations.items() if v},
             })
 
-        # --- Фаза 3. Всё, что осталось после комплектов, снова отдаём одиночным SKU. ---
         single_lines: list[DistributionLine] = []
         for barcode, original_qty in stock.items():
-            if original_qty <= 0:
-                single_lines.append(DistributionLine(barcode=barcode, source_qty=original_qty))
-                continue
-
-            available_for_single = reserved_for_single.get(barcode, 0) + kit_available.get(barcode, 0)
+            qty = reserved_for_single[barcode] + remaining_stock[barcode]
             line = distribute_barcode(
-                barcode=barcode,
-                quantity=available_for_single,
-                warehouses=warehouses,
+                barcode=barcode, quantity=qty, warehouses=warehouses,
                 barcode_variants_by_cabinet=variants_by_cabinet,
                 order_counts_by_cabinet=counts_by_cabinet,
                 threshold=self.settings.distribute_all_threshold,
                 no_sales_target=self.settings.no_sales_target,
-                safety_stock_per_warehouse=self.settings.safety_stock_per_warehouse,
+                safety_stock_per_warehouse=safety,
             )
-            # Для физического отчёта source_qty — исходный остаток до сборки комплектов.
             line.source_qty = original_qty
             single_lines.append(line)
 
