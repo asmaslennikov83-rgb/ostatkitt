@@ -7,10 +7,11 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BotCommand, FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import BotCommand, FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 from .config import load_settings
 from .service import DistributionService
+from .price_compare import build_price_comparison
 from .wb_api import WBApiError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -22,6 +23,7 @@ router = Router()
 
 BTN_DISTRIBUTE = "📦 Загрузить файл для распределения остатков"
 BTN_KITS = "🧩 Загрузить шаблон комплектов"
+BTN_COMPARE = "💰 Сравнить цены"
 user_modes: dict[int, str] = {}
 
 
@@ -30,6 +32,7 @@ def main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_DISTRIBUTE)],
             [KeyboardButton(text=BTN_KITS)],
+            [KeyboardButton(text=BTN_COMPARE)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -88,6 +91,61 @@ async def choose_kits(message: Message):
         "После успешной загрузки этот шаблон будет использоваться до следующего обновления.",
         reply_markup=main_menu(),
     )
+
+
+@router.message(F.text == BTN_COMPARE)
+async def choose_price_comparison(message: Message):
+    if not allowed(message):
+        await message.answer("⛔ Доступ к боту запрещён.")
+        return
+    user_modes.pop(message.from_user.id, None)
+    await message.answer(
+        "💰 Сравнение текущих цен продавца и количества заказов FBO + FBS в двух кабинетах.\n"
+        "В отчёт попадут только товары, присутствующие в обоих кабинетах. Выберите период:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="1 неделя", callback_data="compare_prices:7"),
+             InlineKeyboardButton(text="2 недели", callback_data="compare_prices:14")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("compare_prices:"))
+async def run_price_comparison(query: CallbackQuery):
+    if not query.from_user or query.from_user.id not in settings.allowed_ids:
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+    try:
+        days = int(query.data.split(":", 1)[1])
+        if days not in (7, 14):
+            raise ValueError("Неподдерживаемый период")
+    except (ValueError, AttributeError, IndexError):
+        await query.answer("Неправильный период", show_alert=True)
+        return
+    await query.answer()
+    status = await query.message.answer("⏳ Получаю каталог, цены и заказы двух кабинетов…")
+    try:
+        with tempfile.TemporaryDirectory(prefix="wb_prices_") as tmp:
+            out = Path(tmp) / f"Сравнение_цен_и_заказов_{days}_дней.xlsx"
+            result = await build_price_comparison(settings, days, out)
+            await query.message.answer_document(
+                FSInputFile(out), caption=(
+                    f"✅ Сравнение готово: {result['products']} общих товаров.\n"
+                    f"Заказов: {settings.cabinets[0].name} — {result['orders_1']}, "
+                    f"{settings.cabinets[1].name} — {result['orders_2']}.\n"
+                    f"Без однозначной цены: {result['missing_prices']}; "
+                    f"неоднозначных сопоставлений исключено: {result['ambiguous']}.\n"
+                    "Цена текущая, заказы — за выбранные полные дни; скидки WB не учитываются."
+                ),
+            )
+        await status.edit_text("✅ Отчёт сформирован. Выберите следующее действие.")
+        await query.message.answer("Главное меню:", reply_markup=main_menu())
+    except WBApiError as exc:
+        logger.exception("Price comparison WB API failed")
+        await status.edit_text(f"❌ Не удалось получить данные WB для сравнения цен:\n{exc}\n"
+                               "Проверьте разрешения токенов: Контент, Цены и скидки, Статистика.")
+    except Exception as exc:
+        logger.exception("Price comparison failed")
+        await status.edit_text(f"❌ Не удалось сформировать сравнение цен: {exc}")
 
 
 @router.message(Command("id"))
