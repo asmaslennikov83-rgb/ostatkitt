@@ -23,6 +23,8 @@ from .wb_api import WBClient, WBApiError
 
 PRICE_BASE = "https://discounts-prices-api.wildberries.ru"
 STATS_BASE = "https://statistics-api.wildberries.ru"
+ANALYTICS_BASE = "https://seller-analytics-api.wildberries.ru"
+MARKETPLACE_BASE = "https://marketplace-api.wildberries.ru"
 MSK = ZoneInfo("Europe/Moscow")
 
 
@@ -90,6 +92,48 @@ async def _load_statistics_orders(client: WBClient, days: int) -> list[dict]:
     return [order for order in latest.values() if not order.get("isCancel")]
 
 
+async def _load_fbo_stocks(client: WBClient) -> dict[int, int]:
+    """Current WB-warehouse stock, grouped by variant. Transit fields are excluded."""
+    totals: dict[int, int] = defaultdict(int)
+    offset = 0
+    limit = 250000
+    while True:
+        response = await client._request(
+            "POST", f"{ANALYTICS_BASE}/api/analytics/v1/stocks-report/wb-warehouses",
+            json={"nmIds": [], "chrtIds": [], "limit": limit, "offset": offset},
+        )
+        items = ((response or {}).get("data") or {}).get("items")
+        if not isinstance(items, list):
+            raise WBApiError(f"{client.cabinet.name}: неожиданный формат остатков FBO")
+        for item in items:
+            if item.get("chrtId") is not None:
+                totals[int(item["chrtId"])] += int(item.get("quantity") or 0)
+        if len(items) < limit:
+            break
+        offset += len(items)
+    return dict(totals)
+
+
+async def _load_fbs_stocks(client: WBClient, by_chrt: dict[int, Any]) -> dict[int, int]:
+    """Sum posted FBS inventory across all seller warehouses, per chrtId."""
+    totals: dict[int, int] = defaultdict(int)
+    warehouses = await client.get_warehouses()
+    ids = list(by_chrt)
+    for warehouse in warehouses:
+        for start in range(0, len(ids), 1000):
+            response = await client._request(
+                "POST", f"{MARKETPLACE_BASE}/api/v3/stocks/{warehouse.warehouse_id}",
+                json={"chrtIds": ids[start:start + 1000]},
+            )
+            stocks = (response or {}).get("stocks")
+            if not isinstance(stocks, list):
+                raise WBApiError(f"{client.cabinet.name}: неожиданный формат остатков FBS")
+            for item in stocks:
+                if item.get("chrtId") is not None:
+                    totals[int(item["chrtId"])] += int(item.get("amount") or 0)
+    return dict(totals)
+
+
 def _match_variants(catalogs: list[dict[int, Any]]) -> tuple[list[tuple[Any, Any]], int]:
     """Match only SKUs shared between both cabinets; ignore ambiguous mappings."""
     first, second = catalogs
@@ -134,44 +178,48 @@ def _export_report(path: Path, rows: list[tuple], names: list[str], days: int, a
     wb = Workbook()
     ws = wb.active
     ws.title = "Сравнение цен"
-    ws.append([f"Сравнение цен и заказов • {start_date} — {end_date} • {days} дней"])
-    ws.merge_cells("A1:J1")
+    ws.append([f"Сравнение цен, заказов и остатков • {start_date} — {end_date} • {days} дней"])
+    ws.merge_cells("A1:P1")
     ws["A1"].font = Font(size=14, bold=True, color="FFFFFF")
     ws["A1"].fill = PatternFill("solid", fgColor="193B63")
     ws["A1"].alignment = Alignment(vertical="center")
     ws.row_dimensions[1].height = 30
-    ws.append(["Текущие цены продавца на момент выгрузки; заказы FBO + FBS, без отмен; только товары, присутствующие в обоих кабинетах."])
-    ws.merge_cells("A2:J2")
+    ws.append(["Цены и остатки — на момент выгрузки; заказы FBO + FBS за выбранный период, без отмен; только общие товары двух кабинетов."])
+    ws.merge_cells("A2:P2")
     ws["A2"].alignment = Alignment(wrap_text=True)
     ws.row_dimensions[2].height = 34
     ws.append([
-        "ШК (общий)", "Артикул продавца", f"Цена {names[0]}, ₽", f"Заказы {names[0]}, шт.",
-        f"Цена {names[1]}, ₽", f"Заказы {names[1]}, шт.", "Разница заказов, %",
-        "Разница цен, %", "ШК кабинета 1", "ШК кабинета 2",
+        "ШК (общий)", "Артикул продавца",
+        f"Цена {names[0]}, ₽", f"Заказы {names[0]}, шт.",
+        f"Остатки FBO {names[0]}, шт.", f"Остатки FBS {names[0]}, шт.", f"Остатки всего {names[0]}, шт.",
+        f"Цена {names[1]}, ₽", f"Заказы {names[1]}, шт.",
+        f"Остатки FBO {names[1]}, шт.", f"Остатки FBS {names[1]}, шт.", f"Остатки всего {names[1]}, шт.",
+        "Разница заказов, %", "Разница цен, %", "ШК кабинета 1", "ШК кабинета 2",
     ])
     for cell in ws[3]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="315C83")
         cell.alignment = Alignment(wrap_text=True, vertical="center")
-    ws.row_dimensions[3].height = 40
+    ws.row_dimensions[3].height = 55
     for row in rows:
         ws.append(row)
         idx = ws.max_row
-        # Formula-driven differences; zero baseline remains blank, not infinity.
-        ws.cell(idx, 7, f'=IF(OR(D{idx}="",D{idx}=0),"",(F{idx}-D{idx})/D{idx})')
-        ws.cell(idx, 8, f'=IF(OR(C{idx}="",C{idx}=0,E{idx}=""),"",(E{idx}-C{idx})/C{idx})')
-        for col in (1, 9, 10):
+        ws.cell(idx, 7, f"=E{idx}+F{idx}")
+        ws.cell(idx, 12, f"=J{idx}+K{idx}")
+        ws.cell(idx, 13, f'=IF(OR(D{idx}="",D{idx}=0),"",(I{idx}-D{idx})/D{idx})')
+        ws.cell(idx, 14, f'=IF(OR(C{idx}="",C{idx}=0,H{idx}=""),"",(H{idx}-C{idx})/C{idx})')
+        for col in (1, 15, 16):
             ws.cell(idx, col).number_format = "@"
-        for col in (3, 5):
+        for col in (3, 8):
             ws.cell(idx, col).number_format = '#,##0.00'
-        for col in (7, 8):
+        for col in (13, 14):
             ws.cell(idx, col).number_format = '+0.0%;-0.0%;0.0%'
         if idx % 2 == 0:
             for cell in ws[idx]:
                 cell.fill = PatternFill("solid", fgColor="F1F5F9")
-    ws.auto_filter.ref = f"A3:J{max(3, ws.max_row)}"
+    ws.auto_filter.ref = f"A3:P{max(3, ws.max_row)}"
     ws.freeze_panes = "C4"
-    widths = [22, 27, 19, 21, 19, 21, 21, 19, 22, 22]
+    widths = [22, 27, 19, 21, 23, 23, 23, 19, 21, 23, 23, 23, 21, 19, 22, 22]
     for col, width in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(col)].width = width
     info = wb.create_sheet("Примечания")
@@ -179,12 +227,15 @@ def _export_report(path: Path, rows: list[tuple], names: list[str], days: int, a
         ("Период", f"{start_date} — {end_date}; {days} полных календарных дней (МСК)"),
         ("Цена", "Текущая discountedPrice: цена продавца с его скидкой, без скидок WB/клуба."),
         ("Заказы", "Заказы FBO и FBS из статистики WB; отменённые исключены. Возможна задержка данных API."),
+        ("Остатки FBO", "Текущее количество quantity на складах WB по данным Аналитики; товар в пути не включён. Данные WB обновляются с задержкой."),
+        ("Остатки FBS", "Сумма опубликованных остатков на всех FBS-складах соответствующего кабинета, по chrtID."),
+        ("Остатки всего", "FBO + FBS в пределах одного кабинета. Не физический остаток у продавца; при общих физических запасах FBS двух кабинетов возможен двойной учёт."),
         ("Разница заказов", "(Заказы 2 − Заказы 1) / Заказы 1; при нуле в кабинете 1 — пусто."),
         ("Разница цен", "(Цена 2 − Цена 1) / Цена 1; при нуле/нет цены — пусто."),
         ("Сопоставление", "Только общие ШК двух кабинетов; альтернативные ШК одного размера объединяются."),
         ("Артикул продавца", "Из первого кабинета; при отсутствии — из второго."),
         ("Неоднозначные совпадения", f"Не включены товарные вариации с неоднозначным сопоставлением: {ambiguous}."),
-        ("Ограничение", "Текущую цену нельзя считать исторической ценой за все 7/14 дней; корреляция не доказывает причинность."),
+        ("Ограничение", "Текущую цену/остаток нельзя считать историческими за все 7/14 дней; корреляция не доказывает причинность."),
     ]:
         info.append(record)
     info.column_dimensions["A"].width = 29
@@ -209,10 +260,15 @@ async def build_price_comparison(settings: Settings, days: int, output: Path) ->
             stats_client = (WBClient(replace(client.cabinet, token=stats_token), session)
                             if stats_token else client)
             prices = await _load_prices(price_client)
+            analytics_token = os.getenv(f"WB_ANALYTICS_TOKEN_{index}", "").strip()
+            analytics_client = (WBClient(replace(client.cabinet, token=analytics_token), session)
+                                if analytics_token else client)
             orders = await _load_statistics_orders(stats_client, days)
-            return by_sku, by_chrt, prices, _order_counts(orders, by_sku, by_chrt)
+            fbo = await _load_fbo_stocks(analytics_client)
+            fbs = await _load_fbs_stocks(client, by_chrt)
+            return by_sku, by_chrt, prices, _order_counts(orders, by_sku, by_chrt), fbo, fbs
         cabinet_data = await asyncio.gather(*(get_data(client) for client in clients))
-    (skus_1, catalog_1, price_1, counts_1), (skus_2, catalog_2, price_2, counts_2) = cabinet_data
+    (skus_1, catalog_1, price_1, counts_1, fbo_1, fbs_1), (skus_2, catalog_2, price_2, counts_2, fbo_2, fbs_2) = cabinet_data
     pairs, ambiguous = _match_variants([catalog_1, catalog_2])
     report_rows = []
     missing_prices = 0
@@ -227,11 +283,13 @@ async def build_price_comparison(settings: Settings, days: int, output: Path) ->
         barcode = common[0]
         article = str(good_1.get("vendorCode") or good_2.get("vendorCode") or "")
         report_rows.append((barcode, article, p1, counts_1.get(left.chrt_id, 0),
-                            p2, counts_2.get(right.chrt_id, 0), None, None,
-                            ", ".join(left.skus), ", ".join(right.skus)))
+                            fbo_1.get(left.chrt_id, 0), fbs_1.get(left.chrt_id, 0), None,
+                            p2, counts_2.get(right.chrt_id, 0),
+                            fbo_2.get(right.chrt_id, 0), fbs_2.get(right.chrt_id, 0), None,
+                            None, None, ", ".join(left.skus), ", ".join(right.skus)))
     report_rows.sort(key=lambda row: (str(row[1]).lower(), row[0]))
     today = datetime.now(MSK).date()
     _export_report(output, report_rows, [c.name for c in settings.cabinets], days, ambiguous,
                    (today - timedelta(days=days)).isoformat(), (today - timedelta(days=1)).isoformat())
     return {"products": len(report_rows), "missing_prices": missing_prices, "ambiguous": ambiguous,
-            "orders_1": sum(row[3] for row in report_rows), "orders_2": sum(row[5] for row in report_rows)}
+            "orders_1": sum(row[3] for row in report_rows), "orders_2": sum(row[8] for row in report_rows)}
