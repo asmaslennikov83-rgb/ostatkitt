@@ -24,6 +24,7 @@ router = Router()
 BTN_DISTRIBUTE = "📦 Загрузить файл для распределения остатков"
 BTN_KITS = "🧩 Загрузить шаблон комплектов"
 BTN_COMPARE = "💰 Сравнить цены"
+BTN_EXCLUSIONS = "🚫 Исключения ШК"
 user_modes: dict[int, str] = {}
 
 
@@ -33,6 +34,7 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_DISTRIBUTE)],
             [KeyboardButton(text=BTN_KITS)],
             [KeyboardButton(text=BTN_COMPARE)],
+            [KeyboardButton(text=BTN_EXCLUSIONS)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -51,6 +53,14 @@ def template_status() -> str:
         return "Шаблон комплектов найден, но содержит ошибку. Загрузите его заново."
 
 
+def exclusions_status() -> str:
+    try:
+        marks, skus = service.exclusions_count()
+        return f"Исключения ШК: {skus} ШК / {marks} исключений по кабинетам." if marks else "Исключения ШК пока не заданы."
+    except Exception:
+        return "Файл исключений найден, но содержит ошибку. Загрузите его заново."
+
+
 @router.message(CommandStart())
 async def start(message: Message):
     if not allowed(message):
@@ -59,7 +69,8 @@ async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
     await message.answer(
         "🟢 Бот Wildberries работает.\n\n"
-        f"{template_status()}\n\n"
+        f"{template_status()}\n"
+        f"{exclusions_status()}\n\n"
         "Выберите действие в главном меню:",
         reply_markup=main_menu(),
     )
@@ -89,6 +100,54 @@ async def choose_kits(message: Message):
         "Нужны колонки: «Название», «баркод комплекта», «баркод1», «баркод2» и далее. "
         "Одинаковые баркоды в одной строке означают кратность компонента.\n\n"
         "После успешной загрузки этот шаблон будет использоваться до следующего обновления.",
+        reply_markup=main_menu(),
+    )
+
+
+@router.message(F.text == BTN_EXCLUSIONS)
+async def choose_exclusions(message: Message):
+    if not allowed(message):
+        await message.answer("⛔ Доступ к боту запрещён.")
+        return
+    user_modes.pop(message.from_user.id, None)
+    cab1_id = settings.cabinets[0].seller_id or "не удалось определить автоматически"
+    cab2_id = settings.cabinets[1].seller_id or "не удалось определить автоматически"
+    await message.answer(
+        "🚫 Исключения ШК\n\n"
+        "В шаблоне три колонки: «ШК», «ID кабинета 1», «ID кабинета 2».\n"
+        "Если напротив ШК заполнен ID продавца в колонке нужного кабинета, этот ШК не участвует в распределении именно на этом кабинете.\n"
+        "На втором кабинете тот же ШК продолжает работать, если там ячейка пустая.\n\n"
+        f"Кабинет 1 — {settings.cabinets[0].name}: {cab1_id}\n"
+        f"Кабинет 2 — {settings.cabinets[1].name}: {cab2_id}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Скачать шаблон", callback_data="exclusions:download")],
+            [InlineKeyboardButton(text="📤 Загрузить исключения", callback_data="exclusions:upload")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "exclusions:download")
+async def download_exclusions(query: CallbackQuery):
+    if not query.from_user or query.from_user.id not in settings.allowed_ids:
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+    await query.answer()
+    await query.message.answer_document(
+        FSInputFile(service.exclusions_path),
+        caption="Шаблон исключений ШК. Отредактируйте его и загрузите обратно через кнопку «🚫 Исключения ШК».",
+    )
+
+
+@router.callback_query(F.data == "exclusions:upload")
+async def upload_exclusions(query: CallbackQuery):
+    if not query.from_user or query.from_user.id not in settings.allowed_ids:
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+    user_modes[query.from_user.id] = "exclusions"
+    await query.answer()
+    await query.message.answer(
+        "📤 Пришлите заполненный Excel-файл исключений (.xlsx или .xls).\n"
+        "После успешной загрузки он сохранится и будет применяться ко всем следующим распределениям.",
         reply_markup=main_menu(),
     )
 
@@ -161,7 +220,8 @@ async def status_command(message: Message):
         return
     await message.answer(
         "🟢 Бот работает.\n"
-        f"{template_status()}",
+        f"{template_status()}\n"
+        f"{exclusions_status()}",
         reply_markup=main_menu(),
     )
 
@@ -179,11 +239,33 @@ async def document_handler(message: Message, bot: Bot):
         return
 
     mode = user_modes.get(message.from_user.id)
-    if mode not in {"distribution", "kits"}:
+    if mode not in {"distribution", "kits", "exclusions"}:
         await message.answer(
             "Сначала выберите в главном меню, что именно вы хотите загрузить.",
             reply_markup=main_menu(),
         )
+        return
+
+    if mode == "exclusions":
+        status = await message.answer("⏳ Проверяю и сохраняю исключения ШК…")
+        try:
+            with tempfile.TemporaryDirectory(prefix="wb_exclusions_") as tmp:
+                local_path = Path(tmp) / ("exclusions.xls" if filename.endswith(".xls") else "exclusions.xlsx")
+                file = await bot.get_file(doc.file_id)
+                await bot.download_file(file.file_path, destination=local_path)
+                marks, skus = service.update_exclusions_template(local_path)
+            user_modes.pop(message.from_user.id, None)
+            await status.edit_text(
+                f"✅ Исключения обновлены.\n\nУникальных ШК: {skus}.\n"
+                f"Исключений по кабинетам: {marks}.\n"
+                "Файл сохранён и будет применяться при следующих распределениях."
+            )
+            await message.answer("Выберите следующее действие:", reply_markup=main_menu())
+        except ValueError as exc:
+            await status.edit_text(f"❌ Ошибка файла исключений:\n{exc}")
+        except Exception as exc:
+            logger.exception("Exclusions template update failed")
+            await status.edit_text(f"❌ Не удалось сохранить исключения:\n{exc}")
         return
 
     if mode == "kits":
@@ -292,6 +374,7 @@ async def notify_startup(bot: Bot):
                 user_id,
                 "🟢 Бот Wildberries запущен и работает.\n\n"
                 f"{template_status()}\n"
+                f"{exclusions_status()}\n"
                 "Откройте /start для главного меню."
             )
         except Exception:

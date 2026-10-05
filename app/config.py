@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import base64
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from dotenv import load_dotenv
@@ -25,11 +27,26 @@ def _ids(value: str) -> set[int]:
     return result
 
 
+def _seller_id_from_token(token: str) -> str | None:
+    """Best-effort extraction of WB seller ID (sid) from a JWT token."""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+        value = data.get("sid")
+        return str(value).strip() if value not in (None, "") else None
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class CabinetConfig:
     key: str
     name: str
     token: str
+    seller_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -50,9 +67,17 @@ def load_settings() -> Settings:
     if not allowed:
         raise RuntimeError("TELEGRAM_ALLOWED_IDS пуст")
 
+    token_1 = _required("WB_TOKEN_1")
+    token_2 = _required("WB_TOKEN_2")
     cabinets = (
-        CabinetConfig("cabinet_1", _required("WB_CABINET_1_NAME"), _required("WB_TOKEN_1")),
-        CabinetConfig("cabinet_2", _required("WB_CABINET_2_NAME"), _required("WB_TOKEN_2")),
+        CabinetConfig(
+            "cabinet_1", _required("WB_CABINET_1_NAME"), token_1,
+            os.getenv("WB_CABINET_1_ID", "").strip() or _seller_id_from_token(token_1),
+        ),
+        CabinetConfig(
+            "cabinet_2", _required("WB_CABINET_2_NAME"), token_2,
+            os.getenv("WB_CABINET_2_ID", "").strip() or _seller_id_from_token(token_2),
+        ),
     )
     return Settings(
         telegram_token=_required("TELEGRAM_BOT_TOKEN"),

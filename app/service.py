@@ -12,6 +12,7 @@ from .config import Settings
 from .distributor import distribute_barcode
 from .excel_io import build_summary, read_input_excel, write_warehouse_files
 from .history import cleanup_history, make_run_dir, write_json
+from .exclusions import exclusions_count, read_exclusions, save_exclusions_template
 from .kits import read_kits_excel
 from .models import DistributionLine, KitDefinition, ProductVariant, Warehouse
 from .wb_api import WBClient, count_orders_by_variant_and_warehouse
@@ -176,22 +177,76 @@ def _build_output_sku_maps(
     return all_output, canonical_map
 
 
+def _apply_cabinet_barcode_exclusions(
+    actual_by_cabinet: dict[str, dict[str, ProductVariant]],
+    excluded_by_cabinet: dict[str, set[str]],
+) -> dict[str, dict[str, ProductVariant]]:
+    """Remove forbidden output SKUs only in the selected cabinet.
+
+    If a chrtID has another allowed SKU in that cabinet, the product variation
+    remains available and physical stock may be routed to the allowed alias.
+    If all real SKUs of the variation are forbidden, the variation disappears
+    from calculations for that cabinet entirely.
+    """
+    filtered: dict[str, dict[str, ProductVariant]] = {}
+    for cabinet_key, actual in actual_by_cabinet.items():
+        forbidden = excluded_by_cabinet.get(cabinet_key, set())
+        mapping: dict[str, ProductVariant] = {}
+        seen: set[int] = set()
+        for variant in actual.values():
+            if variant.chrt_id in seen:
+                continue
+            seen.add(variant.chrt_id)
+            allowed_skus = tuple(sku for sku in variant.skus if sku and sku not in forbidden)
+            if not allowed_skus:
+                continue
+            allowed_variant = ProductVariant(
+                cabinet_key=variant.cabinet_key,
+                chrt_id=variant.chrt_id,
+                nm_id=variant.nm_id,
+                skus=allowed_skus,
+            )
+            for sku in allowed_skus:
+                mapping[sku] = allowed_variant
+        filtered[cabinet_key] = mapping
+    return filtered
+
+
 class DistributionService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.template_path = settings.base_dir / "templates" / "stocks_template.xlsx"
         self.default_kits_path = settings.base_dir / "templates" / "kits_template.xlsx"
+        self.default_exclusions_path = settings.base_dir / "templates" / "exclusions_template.xlsx"
         self.data_dir = settings.base_dir / "data"
         self.kits_path = self.data_dir / "kits_template.xlsx"
+        self.exclusions_path = self.data_dir / "exclusions.xlsx"
         self.history_root = self.data_dir / "history"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         if not self.kits_path.exists() and self.default_kits_path.exists():
             shutil.copy2(self.default_kits_path, self.kits_path)
+        if not self.exclusions_path.exists() and self.default_exclusions_path.exists():
+            shutil.copy2(self.default_exclusions_path, self.exclusions_path)
 
     def kits_count(self) -> int:
         if not self.kits_path.exists():
             return 0
         return len(read_kits_excel(self.kits_path))
+
+    def exclusions_count(self) -> tuple[int, int]:
+        return exclusions_count(
+            self.exclusions_path,
+            tuple(c.key for c in self.settings.cabinets),
+            tuple(c.seller_id for c in self.settings.cabinets),
+        )
+
+    def update_exclusions_template(self, input_path: Path) -> tuple[int, int]:
+        return save_exclusions_template(
+            input_path,
+            self.exclusions_path,
+            tuple(c.key for c in self.settings.cabinets),
+            tuple(c.seller_id for c in self.settings.cabinets),
+        )
 
     def update_kits_template(self, input_path: Path) -> int:
         kits = read_kits_excel(input_path)  # сначала валидируем
@@ -273,6 +328,11 @@ class DistributionService:
 
         stock, excluded_barcodes = read_input_excel(input_copy)
         kits: list[KitDefinition] = read_kits_excel(self.kits_path) if self.kits_path.exists() else []
+        cabinet_exclusions = read_exclusions(
+            self.exclusions_path,
+            tuple(c.key for c in self.settings.cabinets),
+            tuple(c.seller_id for c in self.settings.cabinets),
+        )
 
         connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -311,8 +371,13 @@ class DistributionService:
 
         # WB может иметь несколько ШК у одной товарной вариации (один chrtID).
         # Объединяем такие ШК в одну логическую сущность до любых расчётов.
-        actual_variants_by_cabinet = variants_by_cabinet
-        alias_root, alias_groups = _build_sku_alias_groups(actual_variants_by_cabinet)
+        raw_actual_variants_by_cabinet = variants_by_cabinet
+        # Alias relationships come from the raw WB catalog, so an excluded physical
+        # barcode can still resolve to another allowed alias of the same chrtID.
+        alias_root, alias_groups = _build_sku_alias_groups(raw_actual_variants_by_cabinet)
+        actual_variants_by_cabinet = _apply_cabinet_barcode_exclusions(
+            raw_actual_variants_by_cabinet, cabinet_exclusions
+        )
         stock, excluded_roots, preferred_input_by_root, grouped_inputs = _normalize_stock_by_alias_group(
             stock, excluded_barcodes, alias_root
         )
@@ -324,6 +389,9 @@ class DistributionService:
             if len(set(skus)) > 1
         }
         diagnostic["merged_input_aliases"] = merged_input_aliases
+        diagnostic["cabinet_barcode_exclusions"] = {
+            key: sorted(values) for key, values in cabinet_exclusions.items()
+        }
 
         # Inventory is shared by singles and kits. Reserve only what is actually
         # allocated; a single unit may never be counted as both a kit and a single.
@@ -531,6 +599,7 @@ class DistributionService:
             "not_found_kit_barcodes": not_found_kits,
             "excluded_barcodes": sorted(excluded_barcodes),
             "excluded_variant_groups": sorted(excluded_roots),
+            "cabinet_barcode_exclusions": {key: sorted(values) for key, values in cabinet_exclusions.items()},
             "merged_input_aliases": merged_input_aliases,
             "component_consumed_by_kits": dict(component_consumed),
             "kits": kit_report,
