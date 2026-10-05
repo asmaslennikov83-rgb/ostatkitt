@@ -42,6 +42,33 @@ def _iter_rows(path: Path):
     raise ValueError("Шаблон исключений должен быть .xlsx или .xls")
 
 
+
+def create_exclusions_template(
+    target_path: Path,
+    cabinet_ids: tuple[str | None, ...] | None = None,
+) -> Path:
+    """Create a fresh exclusions XLSX template at *target_path*.
+
+    The template is generated at runtime so downloading it does not depend on
+    a pre-bundled file being present in ``templates/``.
+    """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Исключения"
+    ws.append(["ШК", "ID кабинета 1", "ID кабинета 2"])
+    ws.freeze_panes = "A2"
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22
+
+    # Keep one empty editable row. Do not pre-fill seller IDs because an empty
+    # cabinet cell means "allowed"; filling it would accidentally create an
+    # exclusion when the user adds a barcode.
+    ws.append([None, None, None])
+    wb.save(target_path)
+    return target_path
+
 def read_exclusions(
     path: Path,
     cabinet_keys: tuple[str, ...],

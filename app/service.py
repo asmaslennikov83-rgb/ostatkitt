@@ -12,7 +12,7 @@ from .config import Settings
 from .distributor import distribute_barcode
 from .excel_io import build_summary, read_input_excel, write_warehouse_files
 from .history import cleanup_history, make_run_dir, write_json
-from .exclusions import exclusions_count, read_exclusions, save_exclusions_template
+from .exclusions import create_exclusions_template, exclusions_count, read_exclusions, save_exclusions_template
 from .kits import read_kits_excel
 from .models import DistributionLine, KitDefinition, ProductVariant, Warehouse
 from .wb_api import WBClient, count_orders_by_variant_and_warehouse
@@ -232,6 +232,15 @@ class DistributionService:
         if not self.kits_path.exists():
             return 0
         return len(read_kits_excel(self.kits_path))
+
+    def exclusions_download_path(self) -> Path:
+        """Return a downloadable exclusions workbook, creating it if needed."""
+        if self.exclusions_path.exists():
+            return self.exclusions_path
+        return create_exclusions_template(
+            self.exclusions_path,
+            tuple(c.seller_id for c in self.settings.cabinets),
+        )
 
     def exclusions_count(self) -> tuple[int, int]:
         return exclusions_count(

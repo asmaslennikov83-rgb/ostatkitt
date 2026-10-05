@@ -132,10 +132,19 @@ async def download_exclusions(query: CallbackQuery):
         await query.answer("Доступ запрещён", show_alert=True)
         return
     await query.answer()
-    await query.message.answer_document(
-        FSInputFile(service.exclusions_path),
-        caption="Шаблон исключений ШК. Отредактируйте его и загрузите обратно через кнопку «🚫 Исключения ШК».",
-    )
+    try:
+        path = service.exclusions_download_path()
+        await query.bot.send_document(
+            chat_id=query.message.chat.id,
+            document=FSInputFile(path, filename="Исключения_ШК.xlsx"),
+            caption=(
+                "Шаблон исключений ШК. Отредактируйте его и загрузите обратно "
+                "через кнопку «🚫 Исключения ШК»."
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Не удалось отправить шаблон исключений")
+        await query.message.answer(f"❌ Не удалось сформировать шаблон исключений:\n{exc}")
 
 
 @router.callback_query(F.data == "exclusions:upload")
