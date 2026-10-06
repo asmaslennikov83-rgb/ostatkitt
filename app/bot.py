@@ -13,18 +13,24 @@ from .config import load_settings
 from .service import DistributionService
 from .price_compare import build_price_comparison
 from .wb_api import WBApiError
+from .stock_ops import StockManager, StockOperationError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 settings = load_settings()
 service = DistributionService(settings)
+stock_manager = StockManager(settings)
 router = Router()
 
 BTN_DISTRIBUTE = "📦 Загрузить файл для распределения остатков"
 BTN_KITS = "🧩 Загрузить шаблон комплектов"
 BTN_COMPARE = "💰 Сравнить цены"
 BTN_EXCLUSIONS = "🚫 Исключения ШК"
+BTN_ROLLBACK = "↩️ Откатить загрузку"
+BTN_HISTORY = "📂 История загрузок"
+BTN_ZERO = "🛑 Аварийное обнуление FBS"
+pending_runs: dict[int, dict] = {}
 user_modes: dict[int, str] = {}
 
 
@@ -35,6 +41,8 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_KITS)],
             [KeyboardButton(text=BTN_COMPARE)],
             [KeyboardButton(text=BTN_EXCLUSIONS)],
+            [KeyboardButton(text=BTN_ROLLBACK), KeyboardButton(text=BTN_HISTORY)],
+            [KeyboardButton(text=BTN_ZERO)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -43,6 +51,19 @@ def main_menu() -> ReplyKeyboardMarkup:
 
 def allowed(message: Message) -> bool:
     return bool(message.from_user and message.from_user.id in settings.allowed_ids)
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in settings.admin_ids and user_id in settings.allowed_ids
+
+
+def admin_keyboard(kind: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Оба кабинета", callback_data=f"stock:scope:{kind}:both")],
+        [InlineKeyboardButton(text=settings.cabinets[0].name, callback_data=f"stock:scope:{kind}:cabinet_1")],
+        [InlineKeyboardButton(text=settings.cabinets[1].name, callback_data=f"stock:scope:{kind}:cabinet_2")],
+        [InlineKeyboardButton(text="Отмена", callback_data="stock:cancel")],
+    ])
 
 
 def template_status() -> str:
@@ -340,15 +361,17 @@ async def document_handler(message: Message, bot: Bot):
                         "\n".join(f"• {x}" for x in chunk)
                     )
 
-            await message.answer_document(
-                FSInputFile(result["zip"]),
-                caption="Все файлы FBS-складов одним архивом",
+            pending_runs[message.from_user.id] = result
+            user_modes.pop(message.from_user.id, None)
+            await message.answer(
+                "Что сделать с готовым распределением?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📄 Получить Excel-файлы", callback_data="dist:download")],
+                    [InlineKeyboardButton(text="🚀 Загрузить на WB", callback_data="dist:upload")],
+                    [InlineKeyboardButton(text="📄 Скачать и загрузить", callback_data="dist:both")],
+                    [InlineKeyboardButton(text="Отмена", callback_data="dist:cancel")],
+                ]),
             )
-            for file_path in result["files"]:
-                await message.answer_document(FSInputFile(file_path))
-
-        user_modes.pop(message.from_user.id, None)
-        await message.answer("Готов к следующей операции:", reply_markup=main_menu())
 
     except ValueError as exc:
         await status.edit_text(f"❌ Ошибка входного Excel или шаблона комплектов:\n{exc}")
@@ -357,6 +380,280 @@ async def document_handler(message: Message, bot: Bot):
     except Exception as exc:
         logger.exception("Processing failed")
         await status.edit_text(f"❌ Не удалось сформировать распределение:\n{exc}")
+
+
+
+@router.callback_query(F.data.startswith("dist:"))
+async def distribution_action(query: CallbackQuery):
+    user_id = query.from_user.id if query.from_user else 0
+    if user_id not in settings.allowed_ids:
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+    action = query.data.split(":", 1)[1]
+    await query.answer()
+    if action == "cancel":
+        pending_runs.pop(user_id, None)
+        await query.message.answer("Операция отменена. Данные WB не изменены.")
+        return
+    result = pending_runs.get(user_id)
+    if not result:
+        await query.message.answer("Результат распределения не найден. Загрузите Excel заново.")
+        return
+    if action in {"download", "both"}:
+        try:
+            await query.message.answer_document(FSInputFile(result["zip"]), caption="Архив всех FBS-складов")
+            for file_path in result["files"]:
+                await query.message.answer_document(FSInputFile(file_path))
+        except Exception as exc:
+            logger.exception("Distribution download failed")
+            await query.message.answer(f"❌ Не удалось отправить Excel: {exc}")
+            return
+    if action in {"upload", "both"}:
+        if not is_admin(user_id):
+            await query.message.answer("⛔ Загрузка на WB разрешена только администратору. Добавьте ваш ID в TELEGRAM_ADMIN_IDS.")
+            return
+        await query.message.answer("Выберите кабинеты для загрузки:", reply_markup=admin_keyboard("distribution"))
+    else:
+        await query.message.answer("Файлы отправлены. При необходимости можете выбрать загрузку на WB выше.")
+
+
+@router.message(F.text == BTN_HISTORY)
+async def stock_history(message: Message):
+    if not allowed(message):
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ История операций с WB доступна администраторам.")
+        return
+    records = stock_manager.list_records()
+    if not records:
+        await message.answer("История загрузок пока пуста.")
+        return
+    lines = ["📂 Последние операции с остатками WB:"]
+    kind_names = {"distribution": "Загрузка", "zero": "Обнуление", "rollback": "Откат"}
+    for item in records:
+        lines.append(f"{item['created_at'][:19]} — {kind_names.get(item['kind'], item['kind'])}, "
+                     f"{item.get('status', '?')}, подтверждено: {item.get('verified_count', 0)}. "
+                     f"ID: {item['id'][:10]}")
+    await message.answer("\n".join(lines))
+    await message.answer("Резервную копию последней операции можно скачать:",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [InlineKeyboardButton(text="📥 Скачать резервную копию (JSON)",
+                                                   callback_data=f"stock:backup:{records[0]['id']}")],
+                         ]))
+
+
+@router.message(F.text == BTN_ROLLBACK)
+async def rollback_menu(message: Message):
+    if not allowed(message):
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Откат доступен только администратору.")
+        return
+    source = stock_manager.latest_rollback_source()
+    if not source:
+        await message.answer("Нет последнего обновления, которое можно откатить.")
+        return
+    await message.answer(
+        f"↩️ Последнее обновление: {source['created_at'][:19]} UTC, "
+        f"тип: {source['kind']}.\n"
+        "Восстановим только реально изменённые ботом позиции, которые с тех пор не изменились на WB. "
+        "При изменениях из-за заказов эти позиции будут пропущены.",
+        reply_markup=admin_keyboard("rollback"),
+    )
+
+
+@router.message(F.text == BTN_ZERO)
+async def zero_menu(message: Message):
+    if not allowed(message):
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Обнуление доступно только администратору.")
+        return
+    await message.answer(
+        "🛑 АВАРИЙНОЕ ОБНУЛЕНИЕ FBS\n\n"
+        "Будут обнулены ненулевые остатки всех доступных вариантов АКТИВНОГО каталога "
+        "на выбранных складах, включая товары вне последнего Excel. "
+        "FBO не затрагивается.\n\n"
+        "⚠️ API WB не позволяет перечислить все остатки без списка chrtID. "
+        "Товары вне активного каталога могут не попасть в операцию. "
+        "Перед отправкой будет сохранена резервная копия.",
+        reply_markup=admin_keyboard("zero"),
+    )
+
+
+def _preview_text(data: dict) -> str:
+    summary = data['summary']
+    label = {'distribution': 'Загрузка на WB', 'zero': 'Аварийное обнуление',
+             'rollback': 'Восстановление из резервной копии'}[data['kind']]
+    warning = ""
+    if data['kind'] == 'distribution':
+        changes = summary.get('changed', 0)
+        zeroed = summary.get('zeroed', 0)
+        if changes and zeroed / changes >= 0.5:
+            warning = "\n⚠️ ВНИМАНИЕ: половина или больше изменений — обнуления! Проверьте Excel.\n"
+    return (f"🔎 {label} — предпросмотр\n"
+            f"Кабинетов: {len(data['cabinets'])}; складов: {len(data['targets'])}\n"
+            f"Позиций к изменению: {summary.get('changed', 0)}\n"
+            f"Увеличится: {summary.get('increased', 0)}\n"
+            f"Уменьшится: {summary.get('decreased', 0)}\n"
+            f"Обнулится: {summary.get('zeroed', 0)}\n"
+            f"Без изменений: {summary.get('unchanged', 0)}\n"
+            f"Пропущено конфликтующих позиций: {len(data['conflicts'])}\n\n"
+            f"{warning}\n"
+            "⚠️ Это предварительные данные. Перед PUT бот ещё раз сверит WB. "
+            "Операция будет сохранена в истории с резервной копией.")
+
+
+@router.callback_query(F.data.startswith("stock:scope:"))
+async def stock_scope(query: CallbackQuery):
+    user_id = query.from_user.id if query.from_user else 0
+    if not is_admin(user_id):
+        await query.answer("Только для администраторов", show_alert=True)
+        return
+    parts = query.data.split(":")
+    if len(parts) != 4:
+        await query.answer("Некорректный запрос", show_alert=True)
+        return
+    _, _, kind, scope = parts
+    if kind not in {"distribution", "zero", "rollback"} or scope not in {"both", "cabinet_1", "cabinet_2"}:
+        await query.answer("Некорректный запрос", show_alert=True)
+        return
+    await query.answer()
+    status = await query.message.answer("⏳ Считываю текущие остатки и готовлю сравнение с WB…")
+    try:
+        keys = {"cabinet_1", "cabinet_2"} if scope == "both" else {scope}
+        files = None
+        source_id = None
+        if kind == "distribution":
+            run = pending_runs.get(user_id)
+            if not run:
+                raise StockOperationError("Нет готового распределения. Загрузите Excel заново.")
+            files = run['files']
+        if kind == "rollback":
+            source = stock_manager.latest_rollback_source()
+            if not source:
+                raise StockOperationError("Нет последнего обновления для отката")
+            source_id = source['id']
+        data = await stock_manager.preview(kind, user_id, keys, files=files, source_id=source_id)
+        await status.edit_text(_preview_text(data))
+        await query.message.answer_document(FSInputFile(stock_manager.preview_report(data)),
+                                            caption="Сравнение остатков: было на WB → станет")
+        if data['summary'].get('changed', 0) == 0:
+            await query.message.answer("Изменений нет. Отправка на WB не требуется.")
+            return
+        await query.message.answer(
+            "Перейти к подтверждению операции?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Продолжить", callback_data=f"stock:confirm:{data['id']}")],
+                [InlineKeyboardButton(text="Отмена", callback_data="stock:cancel")],
+            ]),
+        )
+    except Exception as exc:
+        logger.exception("Stock preview failed")
+        await status.edit_text(f"❌ Предпросмотр не удался: {exc}. Остатки WB не изменены.")
+
+
+@router.callback_query(F.data.startswith("stock:backup:"))
+async def download_stock_backup(query: CallbackQuery):
+    user_id = query.from_user.id if query.from_user else 0
+    if not is_admin(user_id):
+        await query.answer("Только для администраторов", show_alert=True)
+        return
+    ident = query.data.split(":")[-1]
+    path = stock_manager._record_path(ident)
+    if not ident.isalnum() or not path.is_file():
+        await query.answer("Резервная копия не найдена", show_alert=True)
+        return
+    await query.answer()
+    await query.message.answer_document(FSInputFile(path, filename=f"WB_backup_{ident[:10]}.json"),
+                                        caption="Резервная копия и журнал операции. Храните файл в безопасном месте.")
+
+
+@router.callback_query(F.data == "stock:cancel")
+async def stock_cancel(query: CallbackQuery):
+    await query.answer()
+    if query.from_user:
+        stock_manager.active_previews.pop(query.from_user.id, None)
+    await query.message.answer("Отменено. Остатки WB не изменены.")
+
+
+@router.callback_query(F.data.startswith("stock:confirm:"))
+async def stock_confirm(query: CallbackQuery):
+    user_id = query.from_user.id if query.from_user else 0
+    if not is_admin(user_id):
+        await query.answer("Только для администраторов", show_alert=True)
+        return
+    await query.answer()
+    try:
+        data = stock_manager.get_preview(query.data.split(":")[-1], user_id)
+    except StockOperationError as exc:
+        await query.message.answer(f"❌ {exc}")
+        return
+    if data['kind'] == 'zero':
+        user_modes[user_id] = f"zero_confirm:{data['id']}"
+        await query.message.answer(
+            "🛑 Для подтверждения аварийного обнуления отправьте отдельным сообщением точное слово ОБНУЛИТЬ. "
+            "Это НЕ отменяет необходимость финального подтверждения кнопкой."
+        )
+        return
+    await query.message.answer(
+        "⚠️ Последнее подтверждение. Изменения будут отправлены в WB. "
+        "При ошибке возможна частичная загрузка. Продолжить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, выполнить", callback_data=f"stock:execute:{data['id']}")],
+            [InlineKeyboardButton(text="Отмена", callback_data="stock:cancel")],
+        ]),
+    )
+
+
+@router.message(F.text == "ОБНУЛИТЬ")
+async def zero_phrase(message: Message):
+    if not allowed(message) or not is_admin(message.from_user.id):
+        return
+    mode = user_modes.pop(message.from_user.id, '')
+    if not mode.startswith('zero_confirm:'):
+        await message.answer("Сначала выберите аварийное обнуление в меню и подтвердите предпросмотр.")
+        return
+    ident = mode.split(':', 1)[1]
+    try:
+        data = stock_manager.get_preview(ident, message.from_user.id)
+        if data['kind'] != 'zero':
+            raise StockOperationError('Некорректная операция')
+    except StockOperationError as exc:
+        await message.answer(f"❌ {exc}")
+        return
+    stock_manager.zero_authorized.add((message.from_user.id, ident))
+    await message.answer(
+        "🛑 ПОСЛЕДНЕЕ ПОДТВЕРЖДЕНИЕ: отправить нули на WB?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 ДА, ОБНУЛИТЬ", callback_data=f"stock:execute:{ident}")],
+            [InlineKeyboardButton(text="Отмена", callback_data="stock:cancel")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("stock:execute:"))
+async def stock_execute(query: CallbackQuery):
+    user_id = query.from_user.id if query.from_user else 0
+    if not is_admin(user_id):
+        await query.answer("Только для администраторов", show_alert=True)
+        return
+    ident = query.data.split(":")[-1]
+    await query.answer()
+    status = await query.message.answer("⏳ Обновляю остатки WB и проверяю результат…")
+    try:
+        record = await stock_manager.execute(ident, user_id)
+        text = (f"{'✅' if record['status'] == 'verified' else '⚠️'} Операция: {record['status']}\n"
+                f"Проверено успешных изменений: {record['verified_count']} из {record['expected_count']}\n"
+                f"Ошибок: {sum(len(v) if isinstance(v, list) else 1 for v in record['errors'].values())}\n"
+                "Резервная копия и журнал сохранены в data/stock_operations/records.")
+        await status.edit_text(text)
+        await query.message.answer_document(FSInputFile(stock_manager._record_path(ident),
+                                                        filename=f"WB_result_{ident[:10]}.json"),
+                                            caption="Результат и резервная копия (включая ошибки)")
+    except Exception as exc:
+        logger.exception("Stock operation failed")
+        await status.edit_text(f"❌ Операция не завершена: {exc}. Проверьте историю и фактические остатки WB.")
 
 
 @router.message()

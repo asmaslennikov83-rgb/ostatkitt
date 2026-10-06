@@ -132,6 +132,40 @@ class WBClient:
         return by_barcode, by_chrt
 
 
+    async def get_fbs_stocks(self, warehouse_id: int, chrt_ids: Iterable[int]) -> dict[int, int]:
+        """Read explicitly requested chrtIDs. Missing rows are zero, not an all-stock listing."""
+        ids = sorted({int(x) for x in chrt_ids if int(x) > 0})
+        amounts: dict[int, int] = {chrt: 0 for chrt in ids}
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            data = await self._request(
+                "POST", f"{MARKETPLACE_BASE}/api/v3/stocks/{int(warehouse_id)}",
+                json={"chrtIds": chunk},
+            )
+            if not isinstance(data, dict) or not isinstance(data.get("stocks"), list):
+                raise WBApiError(f"{self.cabinet.name}: неожиданный ответ чтения остатков склада {warehouse_id}")
+            for row in data["stocks"]:
+                chrt = int(row["chrtId"])
+                amount = int(row["amount"])
+                if chrt in amounts:
+                    if amount < 0:
+                        raise WBApiError("WB вернул отрицательный остаток")
+                    amounts[chrt] = amount
+        return amounts
+
+    async def put_fbs_stocks(self, warehouse_id: int, amounts: dict[int, int]) -> None:
+        """Update up to 1000 size IDs; callers must verify with get_fbs_stocks."""
+        if not amounts or len(amounts) > 1000:
+            raise ValueError("За один запрос нужно передать от 1 до 1000 позиций")
+        if any(int(chrt) <= 0 or int(qty) < 0 for chrt, qty in amounts.items()):
+            raise ValueError("Некорректные chrtId или количество")
+        await self._request(
+            "PUT", f"{MARKETPLACE_BASE}/api/v3/stocks/{int(warehouse_id)}",
+            json={"stocks": [{"chrtId": int(chrt), "amount": int(qty)}
+                             for chrt, qty in sorted(amounts.items())]},
+        )
+
+
 def count_orders_by_variant_and_warehouse(
     orders: Iterable[dict],
     valid_warehouse_ids: set[int],

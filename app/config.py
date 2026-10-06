@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import base64
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -60,6 +60,7 @@ class Settings:
     distribute_all_threshold: int
     safety_stock_per_warehouse: int
     base_dir: Path = BASE_DIR
+    admin_ids: set[int] = field(default_factory=set)
 
 
 def load_settings() -> Settings:
@@ -82,6 +83,7 @@ def load_settings() -> Settings:
     return Settings(
         telegram_token=_required("TELEGRAM_BOT_TOKEN"),
         allowed_ids=allowed,
+        admin_ids=_ids(os.getenv("TELEGRAM_ADMIN_IDS", "")) & allowed,
         cabinets=cabinets,
         lookback_days=int(os.getenv("WB_LOOKBACK_DAYS", "14")),
         retention_days=int(os.getenv("HISTORY_RETENTION_DAYS", "4")),
