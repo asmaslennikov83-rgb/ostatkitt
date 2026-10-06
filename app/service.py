@@ -37,51 +37,72 @@ def _kit_target_sets(possible_sets: int, sales_14d: int, warehouse_count: int, s
 def _build_sku_alias_groups(
     variants_by_cabinet: dict[str, dict[str, ProductVariant]],
 ) -> tuple[dict[str, str], dict[str, set[str]]]:
-    """Build global SKU alias groups from WB variants.
+    """Group SKU aliases only when doing so does not conflate distinct WB variants.
 
-    Every set of SKUs belonging to one chrtID is one product variation. If a SKU
-    is shared between cabinets, the groups are merged across cabinets.
+    An alias relation observed in cabinet B must NOT merge two different chrtIDs
+    from cabinet A. Otherwise separate physical stock entries can be summed and
+    later routed under the wrong SKU. Such contradictory relations are left
+    separate; each cabinet can still map its own SKUs to the same chrtID.
     """
     parent: dict[str, str] = {}
+    members: dict[str, set[str]] = {}
+    variant_ids: dict[str, dict[str, set[int]]] = {}
 
     def find(x: str) -> str:
         parent.setdefault(x, x)
+        members.setdefault(x, {x})
+        variant_ids.setdefault(x, {})
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra == rb:
-            return
-        # Stable root makes reports/tests deterministic.
-        if ra <= rb:
-            parent[rb] = ra
-        else:
-            parent[ra] = rb
-
+    # Collect all cabinet-local identities before processing any alias edge.
+    # This makes the result independent of the order returned by the WB API.
     seen_variants: set[tuple[str, int]] = set()
+    variants: list[tuple[str, int, list[str]]] = []
     for cabinet_key, barcode_map in variants_by_cabinet.items():
         for variant in barcode_map.values():
             marker = (cabinet_key, variant.chrt_id)
             if marker in seen_variants:
                 continue
             seen_variants.add(marker)
-            skus = [str(x).strip() for x in variant.skus if str(x).strip()]
+            skus = list(dict.fromkeys(str(sku).strip() for sku in variant.skus if str(sku).strip()))
             if not skus:
                 continue
+            variants.append((cabinet_key, variant.chrt_id, skus))
             for sku in skus:
                 find(sku)
-            first = skus[0]
-            for sku in skus[1:]:
-                union(first, sku)
+                variant_ids[sku].setdefault(cabinet_key, set()).add(variant.chrt_id)
+
+    def union(a: str, b: str) -> bool:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return True
+        combined = {key: set(ids) for key, ids in variant_ids[ra].items()}
+        for key, ids in variant_ids[rb].items():
+            combined.setdefault(key, set()).update(ids)
+        # Distinct chrtIDs in the same cabinet are distinct saleable variants.
+        if any(len(ids) > 1 for ids in combined.values()):
+            return False
+        if ra > rb:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        members[ra].update(members.pop(rb))
+        variant_ids[ra] = combined
+        variant_ids.pop(rb)
+        return True
+
+    for _cabinet_key, _chrt_id, skus in variants:
+        first = skus[0]
+        for sku in skus[1:]:
+            union(first, sku)
 
     groups: dict[str, set[str]] = {}
-    for sku in list(parent):
+    for sku in parent:
         root = find(sku)
         groups.setdefault(root, set()).add(sku)
-    alias_root = {sku: root for root, members in groups.items() for sku in members}
+    alias_root = {sku: root for root, skus in groups.items() for sku in skus}
     return alias_root, groups
 
 
@@ -139,7 +160,12 @@ def _build_output_sku_maps(
     preferred_input_by_root: dict[str, str],
     kit_barcodes: set[str],
 ) -> tuple[dict[str, set[str]], dict[str, dict[str, str]]]:
-    """Choose exactly one output SKU per product variation and cabinet."""
+    """Choose one allowed output SKU for each cabinet-local chrtID.
+
+    A variant may contain SKUs belonging to multiple *physical* alias groups
+    when catalogs disagree across cabinets. All of those SKUs must still map
+    to exactly one output SKU for this cabinet-local chrtID.
+    """
     all_output: dict[str, set[str]] = {}
     canonical_map: dict[str, dict[str, str]] = {}
 
@@ -148,7 +174,6 @@ def _build_output_sku_maps(
         alias_to_output: dict[str, str] = {}
         processed_chrt: set[int] = set()
 
-        # Iterate unique real variants in the cabinet, not every SKU.
         for variant in actual.values():
             if variant.chrt_id in processed_chrt:
                 continue
@@ -156,19 +181,26 @@ def _build_output_sku_maps(
             real_skus = [sku for sku in variant.skus if sku]
             if not real_skus:
                 continue
-            root = alias_root.get(real_skus[0], real_skus[0])
-            if root in excluded_roots:
+            roots = {alias_root.get(sku, sku) for sku in real_skus}
+            if roots & excluded_roots:
                 continue
-            members = groups.get(root, set(real_skus))
 
-            preferred = preferred_input_by_root.get(root)
+            preferred = next(
+                (preferred_input_by_root.get(alias_root.get(sku, sku))
+                 for sku in real_skus
+                 if preferred_input_by_root.get(alias_root.get(sku, sku)) in real_skus),
+                None,
+            )
             if preferred not in real_skus:
                 preferred = next((sku for sku in real_skus if sku in kit_barcodes), None)
             if preferred not in real_skus:
                 preferred = sorted(real_skus)[0]
 
             output_set.add(preferred)
-            for alias in members | set(real_skus):
+            aliases = set(real_skus)
+            for root in roots:
+                aliases.update(groups.get(root, set()))
+            for alias in aliases:
                 alias_to_output[alias] = preferred
 
         all_output[cabinet_key] = output_set
@@ -384,6 +416,25 @@ class DistributionService:
         # Alias relationships come from the raw WB catalog, so an excluded physical
         # barcode can still resolve to another allowed alias of the same chrtID.
         alias_root, alias_groups = _build_sku_alias_groups(raw_actual_variants_by_cabinet)
+        # Diagnostic: a WB variant with SKUs from different physical alias groups
+        # signals conflicting catalog relationships across seller accounts.
+        # Such groups must never be pooled into one physical stock balance.
+        conflicts = []
+        seen_catalog_variants = set()
+        for cabinet_key, catalog in raw_actual_variants_by_cabinet.items():
+            for variant in catalog.values():
+                marker = (cabinet_key, variant.chrt_id)
+                if marker in seen_catalog_variants:
+                    continue
+                seen_catalog_variants.add(marker)
+                roots = {alias_root.get(sku, sku) for sku in variant.skus}
+                if len(roots) > 1:
+                    conflicts.append({
+                        "cabinet": cabinet_key,
+                        "chrt_id": variant.chrt_id,
+                        "skus": list(variant.skus),
+                    })
+        diagnostic["conflicting_alias_variants"] = conflicts
         actual_variants_by_cabinet = _apply_cabinet_barcode_exclusions(
             raw_actual_variants_by_cabinet, cabinet_exclusions
         )
