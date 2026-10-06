@@ -26,12 +26,13 @@ class WBClient:
 
     async def _request(self, method: str, url: str, **kwargs):
         last_error: Exception | None = None
-        for attempt in range(4):
+        attempts = 1 if method in {'PUT', 'DELETE'} else 4
+        for attempt in range(attempts):
             try:
                 async with self.session.request(method, url, headers=self.headers, timeout=60, **kwargs) as resp:
                     if resp.status in (429, 500, 502, 503, 504):
                         body = await resp.text()
-                        if attempt == 3:
+                        if attempt == attempts - 1:
                             raise WBApiError(f"{self.cabinet.name}: WB API {resp.status}: {body[:500]}")
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue
@@ -43,7 +44,7 @@ class WBClient:
                     return await resp.json(content_type=None)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_error = exc
-                if attempt == 3:
+                if attempt == attempts - 1:
                     raise WBApiError(f"{self.cabinet.name}: ошибка соединения с WB API: {exc}") from exc
                 await asyncio.sleep(1.5 * (attempt + 1))
         raise WBApiError(str(last_error))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import uuid
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -32,6 +33,7 @@ BTN_HISTORY = "📂 История загрузок"
 BTN_ZERO = "🛑 Аварийное обнуление FBS"
 pending_runs: dict[int, dict] = {}
 user_modes: dict[int, str] = {}
+zero_selections: dict[int, dict] = {}
 
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -58,12 +60,65 @@ def is_admin(user_id: int) -> bool:
 
 
 def admin_keyboard(kind: str):
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="Оба кабинета", callback_data=f"stock:scope:{kind}:both")],
         [InlineKeyboardButton(text=settings.cabinets[0].name, callback_data=f"stock:scope:{kind}:cabinet_1")],
         [InlineKeyboardButton(text=settings.cabinets[1].name, callback_data=f"stock:scope:{kind}:cabinet_2")],
         [InlineKeyboardButton(text="Отмена", callback_data="stock:cancel")],
-    ])
+    ]
+    if kind == 'zero':
+        rows.insert(-1, [InlineKeyboardButton(text='Выбрать склады', callback_data='stock:warehouses')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def warehouse_keyboard(selection: dict):
+    rows = [[InlineKeyboardButton(
+        text=f"{'✅' if key in selection['selected'] else '⬜'} {label}",
+        callback_data=f"stock:warehouse:{selection['id']}:{index}",
+    )] for index, (key, label) in enumerate(selection['choices'].items())]
+    rows.append([InlineKeyboardButton(text='Сравнить выбранные склады', callback_data='stock:scope:zero:selected')])
+    rows.append([InlineKeyboardButton(text='Отмена', callback_data='stock:cancel')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == 'stock:warehouses')
+async def choose_zero_warehouses(query: CallbackQuery):
+    actor = query.from_user.id
+    if not is_admin(actor):
+        await query.answer('Только для администраторов', show_alert=True)
+        return
+    await query.answer()
+    try:
+        selection = {'id': uuid.uuid4().hex[:12],
+                     'choices': await stock_manager.warehouse_choices(actor), 'selected': set()}
+        zero_selections[actor] = selection
+        await query.message.answer('Отметьте склады для обнуления:', reply_markup=warehouse_keyboard(selection))
+    except Exception as exc:
+        await query.message.answer(f'Не удалось получить склады: {exc}')
+
+
+@router.callback_query(F.data.startswith('stock:warehouse:'))
+async def toggle_zero_warehouse(query: CallbackQuery):
+    actor = query.from_user.id
+    if not is_admin(actor):
+        await query.answer('Только для администраторов', show_alert=True)
+        return
+    selection = zero_selections.get(actor)
+    try:
+        index = int(query.data.rsplit(':', 1)[1])
+        if not selection or index < 0 or query.data.split(':')[-2] != selection['id']:
+            raise ValueError()
+        key = list(selection['choices'])[index]
+    except (ValueError, IndexError):
+        await query.answer('Откройте выбор складов заново', show_alert=True)
+        return
+    if key in selection['selected']:
+        selection['selected'].remove(key)
+    else:
+        selection['selected'].add(key)
+    stock_manager.active_previews.pop(actor, None)
+    await query.answer()
+    await query.message.edit_reply_markup(reply_markup=warehouse_keyboard(selection))
 
 
 def template_status() -> str:
@@ -435,10 +490,11 @@ async def stock_history(message: Message):
                      f"{item.get('status', '?')}, подтверждено: {item.get('verified_count', 0)}. "
                      f"ID: {item['id'][:10]}")
     await message.answer("\n".join(lines))
-    await message.answer("Резервную копию последней операции можно скачать:",
+    await message.answer("Резервные копии последних операций:",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                             [InlineKeyboardButton(text="📥 Скачать резервную копию (JSON)",
-                                                   callback_data=f"stock:backup:{records[0]['id']}")],
+                             [InlineKeyboardButton(text=f"📥 {item['created_at'][:19]} — {item['id'][:8]}",
+                                                   callback_data=f"stock:backup:{item['id']}")]
+                             for item in records
                          ]))
 
 
@@ -499,6 +555,7 @@ def _preview_text(data: dict) -> str:
             f"Обнулится: {summary.get('zeroed', 0)}\n"
             f"Без изменений: {summary.get('unchanged', 0)}\n"
             f"Пропущено конфликтующих позиций: {len(data['conflicts'])}\n\n"
+            f"Защищено исключениями: {len(data.get('excluded_positions', []))}\n"
             f"{warning}\n"
             "⚠️ Это предварительные данные. Перед PUT бот ещё раз сверит WB. "
             "Операция будет сохранена в истории с резервной копией.")
@@ -515,13 +572,19 @@ async def stock_scope(query: CallbackQuery):
         await query.answer("Некорректный запрос", show_alert=True)
         return
     _, _, kind, scope = parts
-    if kind not in {"distribution", "zero", "rollback"} or scope not in {"both", "cabinet_1", "cabinet_2"}:
+    if kind not in {"distribution", "zero", "rollback"} or scope not in {"both", "cabinet_1", "cabinet_2", "selected"} or (scope == 'selected' and kind != 'zero'):
         await query.answer("Некорректный запрос", show_alert=True)
         return
     await query.answer()
     status = await query.message.answer("⏳ Считываю текущие остатки и готовлю сравнение с WB…")
     try:
         keys = {"cabinet_1", "cabinet_2"} if scope == "both" else {scope}
+        warehouse_keys = None
+        if scope == 'selected':
+            warehouse_keys = set(zero_selections.get(user_id, {}).get('selected', set()))
+            if not warehouse_keys:
+                raise StockOperationError('Выберите хотя бы один склад')
+            keys = {key.split(':', 1)[0] for key in warehouse_keys}
         files = None
         source_id = None
         if kind == "distribution":
@@ -534,7 +597,8 @@ async def stock_scope(query: CallbackQuery):
             if not source:
                 raise StockOperationError("Нет последнего обновления для отката")
             source_id = source['id']
-        data = await stock_manager.preview(kind, user_id, keys, files=files, source_id=source_id)
+        data = await stock_manager.preview(kind, user_id, keys, files=files, source_id=source_id,
+                                           warehouse_keys=warehouse_keys)
         await status.edit_text(_preview_text(data))
         await query.message.answer_document(FSInputFile(stock_manager.preview_report(data)),
                                             caption="Сравнение остатков: было на WB → станет")
@@ -574,7 +638,9 @@ async def stock_cancel(query: CallbackQuery):
     await query.answer()
     if query.from_user:
         stock_manager.active_previews.pop(query.from_user.id, None)
-    await query.message.answer("Отменено. Остатки WB не изменены.")
+        zero_selections.pop(query.from_user.id, None)
+        user_modes.pop(query.from_user.id, None)
+    await query.message.answer("Предпросмотр отменён. Уже запущенную запись эта кнопка не останавливает; её результат будет в истории.")
 
 
 @router.callback_query(F.data.startswith("stock:confirm:"))

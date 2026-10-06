@@ -28,8 +28,11 @@ def _iter_rows(path: Path):
     suffix = path.suffix.lower()
     if suffix == ".xlsx":
         wb = load_workbook(path, read_only=True, data_only=True)
-        ws = wb.active
-        for row in ws.iter_rows(values_only=True):
+        try:
+            rows = list(wb.active.iter_rows(values_only=True))
+        finally:
+            wb.close()
+        for row in rows:
             yield list(row)
         return
     if suffix == ".xls":

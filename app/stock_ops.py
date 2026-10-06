@@ -18,6 +18,7 @@ from openpyxl import Workbook, load_workbook
 
 from .config import Settings
 from .excel_io import safe_filename
+from .exclusions import read_exclusions
 from .wb_api import WBClient, WBApiError
 
 
@@ -128,7 +129,28 @@ class StockManager:
         self.zero_authorized: set[tuple[int, str]] = set()
 
     def _record_path(self, ident: str) -> Path:
+        if not ident.isalnum():
+            raise StockOperationError('Некорректный ID операции')
         return self.records / f'{ident}.json'
+
+    def _require_admin(self, actor: int) -> None:
+        if actor not in self.settings.allowed_ids or actor not in self.settings.admin_ids:
+            raise StockOperationError('Операция доступна только администратору')
+
+    def _exclusions(self) -> dict[str, set[str]]:
+        cabinets = self.settings.cabinets
+        return read_exclusions(self.settings.base_dir / 'data' / 'exclusions.xlsx',
+                               tuple(cab.key for cab in cabinets),
+                               tuple(cab.seller_id for cab in cabinets))
+
+    async def warehouse_choices(self, actor: int) -> dict[str, str]:
+        self._require_admin(actor)
+        async with aiohttp.ClientSession() as session:
+            result = {}
+            for cabinet in self.settings.cabinets:
+                for warehouse in await WBClient(cabinet, session).get_warehouses():
+                    result[_key(cabinet.key, warehouse.warehouse_id)] = f'{cabinet.name} — {warehouse.name}'
+            return result
 
     def _preview_path(self, ident: str) -> Path:
         return self.previews / f'{ident}.json'
@@ -153,7 +175,8 @@ class StockManager:
         return by_sku, by_id
 
     async def preview(self, kind: str, actor: int, keys: set[str], files: list[Path] | None = None,
-                      source_id: str | None = None) -> dict:
+                      source_id: str | None = None, warehouse_keys: set[str] | None = None) -> dict:
+        self._require_admin(actor)
         if self.lock.locked():
             raise StockOperationError("Идёт загрузка на WB. Дождитесь завершения")
         if kind not in {'distribution', 'zero', 'rollback'}:
@@ -166,6 +189,8 @@ class StockManager:
         targets: dict[str, dict[int, int]] = {}
         labels: dict[str, str] = {}
         skus: dict[str, dict[int, str]] = {}
+        exclusions = self._exclusions()
+        protected = {}
         async with aiohttp.ClientSession() as session:
             clients = {cab.key: WBClient(cab, session) for cab in cabinets}
             warehouses = {}
@@ -179,8 +204,14 @@ class StockManager:
                     warehouses[_key(cab.key, wh.warehouse_id)] = wh
                 _barcodes, by_chrt = await client.get_catalog_variants()
                 catalogs[cab.key], skus[cab.key] = self._catalog(by_chrt)
+                protected[cab.key] = {int(chrt) for chrt, variant in by_chrt.items()
+                                      if set(variant.skus) & exclusions.get(cab.key, set())}
                 if not by_chrt:
                     raise StockOperationError(f'Не удалось получить каталог {cab.name}')
+            if warehouse_keys is not None:
+                if kind != 'zero' or not warehouse_keys or not warehouse_keys.issubset(warehouses):
+                    raise StockOperationError('Некорректный выбор складов')
+                warehouses = {key: value for key, value in warehouses.items() if key in warehouse_keys}
             if kind == 'distribution':
                 targets, labels = load_distribution_targets(files or [], warehouses, catalogs)
             elif kind == 'zero':
@@ -205,10 +236,17 @@ class StockManager:
                     if key not in warehouses:
                         raise StockOperationError(f'Склад {key} удалён; откат невозможен')
                     # Only restore positions that were actually verified as updated.
-                    targets[key] = {int(chrt): int(record['before'][key][chrt]) for chrt in rows}
+                    restored = set(record.get('restored', {}).get(key, []))
+                    targets[key] = {int(chrt): int(record['before'][key][chrt]) for chrt in rows if chrt not in restored}
                     labels[key] = record['labels'][key]
                 if not targets:
                     raise StockOperationError('Нет подтверждённых позиций для выбранных кабинетов')
+            excluded_positions = []
+            for key, rows in targets.items():
+                for chrt in list(rows):
+                    if chrt in protected[key.split(':', 1)[0]]:
+                        excluded_positions.append(f'{key}:{chrt}')
+                        del rows[chrt]
             before: dict[str, dict[int, int]] = {}
             if kind == 'zero':
                 # Read every known active variant. Zero only the nonzero ones.
@@ -238,6 +276,8 @@ class StockManager:
                 'labels': labels, 'skus': {cab: {str(c): sku for c, sku in mapping.items()}
                                           for cab, mapping in skus.items()},
                 'source_id': source_id, 'conflicts': conflicts,
+                'excluded_positions': excluded_positions,
+                'exclusions': {key: sorted(value) for key, value in exclusions.items()},
                 'summary': compare({key: {str(c): q for c, q in rows.items()} for key, rows in before.items()},
                                    {key: {str(c): q for c, q in rows.items()} for key, rows in targets.items()}),
             }
@@ -261,7 +301,7 @@ class StockManager:
             raise StockOperationError('Прошло более 15 минут. Повторите сравнение с WB')
         return data
 
-    def list_records(self, limit: int = 10) -> list[dict]:
+    def list_records(self, limit: int | None = 10) -> list[dict]:
         records = []
         for path in self.records.glob('*.json'):
             try:
@@ -271,7 +311,7 @@ class StockManager:
         return sorted(records, key=lambda r: r['created_at'], reverse=True)[:limit]
 
     def latest_rollback_source(self) -> dict | None:
-        for item in self.list_records(100):
+        for item in self.list_records(None):
             if item.get('kind') in {'distribution', 'zero'} and any(item.get('applied', {}).values()) and not item.get('rolled_back_at'):
                 return item
         return None
@@ -295,10 +335,13 @@ class StockManager:
         return target
 
     async def execute(self, ident: str, actor: int) -> dict:
+        self._require_admin(actor)
         if self.lock.locked():
             raise StockOperationError('Уже выполняется другая операция с остатками')
         async with self.lock:
             preview = self.get_preview(ident, actor)
+            if preview.get('exclusions') != {key: sorted(value) for key, value in self._exclusions().items()}:
+                raise StockOperationError('Исключения изменились. Повторите сравнение с WB')
             if self._record_path(ident).exists():
                 raise StockOperationError('Эта операция уже запускалась')
             if preview["kind"] == "zero" and (actor, ident) not in self.zero_authorized:
@@ -345,6 +388,8 @@ class StockManager:
                     for chunk in _chunks(changed):
                         sent_or_uncertain = False
                         try:
+                            if preview['exclusions'] != {name: sorted(value) for name, value in self._exclusions().items()}:
+                                raise StockOperationError('Исключения изменились во время загрузки')
                             # One more check before each PUT, to catch concurrent WB changes.
                             actual = await clients[cab].get_fbs_stocks(int(warehouse), chunk)
                             if any(actual[chrt] != before[key][chrt] for chrt in chunk):
@@ -379,22 +424,19 @@ class StockManager:
             _save(self._record_path(ident), record)
             self.active_previews.pop(actor, None)
             self.zero_authorized.discard((actor, ident))
-            if preview['kind'] == 'rollback' and record['status'] == 'verified':
+            if preview['kind'] == 'rollback':
                 source = _load(self._record_path(preview['source_id']))
                 # A rollback may select only one cabinet or skip conflicted chrtIDs.
                 # Mark a warehouse restored only when ALL its applied IDs were restored.
                 restored_keys = set(source.get('rolled_back_keys', []))
+                restored = source.setdefault('restored', {})
                 for key, ids in source.get('applied', {}).items():
-                    if ids and set(ids).issubset(set(record['applied'].get(key, []))):
+                    restored[key] = sorted(set(restored.get(key, [])) | set(record['applied'].get(key, [])))
+                    if ids and set(ids).issubset(restored[key]):
                         restored_keys.add(key)
                 source['rolled_back_keys'] = sorted(restored_keys)
                 if all(not ids or key in restored_keys for key, ids in source.get('applied', {}).items()):
                     source['rolled_back_at'] = utcnow()
                     source['rolled_back_by'] = actor
                 _save(self._record_path(source['id']), source)
-            # Retain last 10 operations; never delete an unfinished operation.
-            history = self.list_records(10000)
-            for old in history[10:]:
-                if old.get('status') in {'verified', 'partial', 'aborted'}:
-                    self._record_path(old['id']).unlink(missing_ok=True)
             return record

@@ -21,11 +21,14 @@ def _iter_input_rows(path: Path):
     suffix = path.suffix.lower()
     if suffix == ".xlsx":
         wb = load_workbook(path, read_only=True, data_only=True)
-        ws = wb.active
-        headers = [_norm(ws.cell(1, col).value) for col in range(1, ws.max_column + 1)]
-        yield headers
-        for row in range(2, ws.max_row + 1):
-            yield [ws.cell(row, col).value for col in range(1, ws.max_column + 1)]
+        try:
+            rows = list(wb.active.iter_rows(values_only=True))
+        finally:
+            wb.close()
+        if rows:
+            yield [_norm(value) for value in rows[0]]
+            for row in rows[1:]:
+                yield list(row)
         return
     if suffix == ".xls":
         import xlrd
