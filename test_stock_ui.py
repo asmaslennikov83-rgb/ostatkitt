@@ -33,16 +33,19 @@ def test_non_admin_can_download_but_not_upload(bot_module, tmp_path):
     bot_module.pending_runs[456] = {'zip': tmp_path / 'run.zip', 'files': [tmp_path / 'warehouse.xlsx']}
     request = query('dist:both', 456)
     asyncio.run(bot_module.distribution_action(request))
-    assert request.message.answer_document.await_count == 2
+    assert request.message.answer_document.await_count == 1
+    assert request.message.answer_document.call_args.args[0].path == tmp_path / 'run.zip'
     assert 'только администратору' in request.message.answer.call_args.args[0]
 
 
-@pytest.mark.parametrize('action, count', [('download', 2), ('upload', 0), ('both', 2)])
+@pytest.mark.parametrize('action, count', [('download', 1), ('upload', 0), ('both', 1)])
 def test_three_distribution_actions(bot_module, tmp_path, action, count):
     bot_module.pending_runs[123] = {'zip': tmp_path / 'run.zip', 'files': [tmp_path / 'warehouse.xlsx']}
     request = query(f'dist:{action}')
     asyncio.run(bot_module.distribution_action(request))
     assert request.message.answer_document.await_count == count
+    if count:
+        assert request.message.answer_document.call_args.args[0].path == tmp_path / 'run.zip'
     if action != 'download':
         assert 'кабинеты' in request.message.answer.call_args.args[0]
 
