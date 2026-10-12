@@ -10,7 +10,7 @@ from .models import DistributionLine, RunSummary, Warehouse
 
 
 BARCODE_HEADERS = {"код", "баркод", "штрихкод", "barcode", "шк"}
-QTY_HEADERS = {"доступно", "количество", "кол-во", "qty", "quantity", "остаток"}
+QTY_HEADERS = {"доступно", "наличие", "количество", "кол-во", "qty", "quantity", "остаток"}
 
 
 def _norm(value) -> str:
@@ -43,7 +43,7 @@ def _iter_input_rows(path: Path):
     raise ValueError("Поддерживаются только файлы .xlsx и .xls")
 
 
-def read_input_excel(path: Path) -> tuple[dict[str, int], set[str]]:
+def read_input_with_controls(path: Path) -> tuple[dict[str, int], set[str], set[str]]:
     rows = iter(_iter_input_rows(path))
     try:
         headers = next(rows)
@@ -60,6 +60,7 @@ def read_input_excel(path: Path) -> tuple[dict[str, int], set[str]]:
 
     result: dict[str, int] = {}
     excluded: set[str] = set()
+    zero_kits: set[str] = set()
     for values in rows:
         barcode_raw = values[barcode_col] if barcode_col < len(values) else None
         qty_raw = values[qty_col] if qty_col < len(values) else None
@@ -73,8 +74,15 @@ def read_input_excel(path: Path) -> tuple[dict[str, int], set[str]]:
         if str(qty_raw or "").strip() == "!":
             excluded.add(barcode)
             result.pop(barcode, None)
+            zero_kits.discard(barcode)
             continue
         if barcode in excluded:
+            continue
+        if str(qty_raw or "").strip() == "%":
+            zero_kits.add(barcode)
+            result[barcode] = 0
+            continue
+        if barcode in zero_kits:
             continue
         try:
             qty = int(float(qty_raw or 0))
@@ -85,7 +93,12 @@ def read_input_excel(path: Path) -> tuple[dict[str, int], set[str]]:
         result[barcode] = result.get(barcode, 0) + qty
     if not result and not excluded:
         raise ValueError("В файле нет строк с остатками")
-    return result, excluded
+    return result, excluded, zero_kits
+
+
+def read_input_excel(path: Path) -> tuple[dict[str, int], set[str]]:
+    stock, excluded, _zero_kits = read_input_with_controls(path)
+    return stock, excluded
 
 
 # Обратная совместимость для внутренних импортов старых версий.

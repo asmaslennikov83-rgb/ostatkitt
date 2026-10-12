@@ -159,7 +159,11 @@ async def choose_distribution(message: Message):
         return
     user_modes[message.from_user.id] = "distribution"
     await message.answer(
-        "📦 Пришлите Excel-файл (.xlsx или .xls) с двумя колонками: «Код» и «Доступно».\nСтарые названия «Баркод» и «Количество» тоже поддерживаются.\n\n"
+        "📦 Пришлите Excel-файл (.xlsx или .xls) с колонками «Код» и «Доступно» / «Наличие».\nСтарые названия «Баркод» и «Количество» тоже поддерживаются.\n\n"
+        "Готовый комплект с положительным остатком распределяется без дополнительной сборки.\n"
+        "Знак % вместо количества комплекта запрещает сборку и выставляет нули. "
+        "При 0 или отсутствии ШК сборка остаётся разрешённой. "
+        "Знак ! по-прежнему исключает позицию из изменений.\n\n"
         "При распределении я учту актуальный шаблон комплектов.",
         reply_markup=main_menu(),
     )
@@ -390,7 +394,7 @@ async def document_handler(message: Message, bot: Bot):
                 f"Физического товара во входном файле: {summary.input_units} шт.\n"
                 f"Использовано/распределено физического товара: {summary.allocated_units} шт.\n"
                 f"Осталось в резерве: {summary.reserve_units} шт.\n"
-                f"Сформировано комплектов: {summary.kit_units} шт. ({summary.kit_skus} SKU)\n"
+                f"Собрано комплектов из компонентов: {summary.kit_units} шт. ({summary.kit_skus} SKU)\n"
                 f"Файлов складов: {summary.output_files}\n"
                 f"Одиночных ШК без истории заказов: {len(summary.no_sales_barcodes)}\n"
                 f"Одиночных ШК не найдены в WB: {len(summary.not_found_barcodes)}\n"
@@ -421,9 +425,9 @@ async def document_handler(message: Message, bot: Bot):
             await message.answer(
                 "Что сделать с готовым распределением?",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="📄 Получить Excel-файлы", callback_data="dist:download")],
+                    [InlineKeyboardButton(text="📦 Получить общий архив", callback_data="dist:download")],
                     [InlineKeyboardButton(text="🚀 Загрузить на WB", callback_data="dist:upload")],
-                    [InlineKeyboardButton(text="📄 Скачать и загрузить", callback_data="dist:both")],
+                    [InlineKeyboardButton(text="📦 Скачать архив и загрузить", callback_data="dist:both")],
                     [InlineKeyboardButton(text="Отмена", callback_data="dist:cancel")],
                 ]),
             )
@@ -457,8 +461,6 @@ async def distribution_action(query: CallbackQuery):
     if action in {"download", "both"}:
         try:
             await query.message.answer_document(FSInputFile(result["zip"]), caption="Архив всех FBS-складов")
-            for file_path in result["files"]:
-                await query.message.answer_document(FSInputFile(file_path))
         except Exception as exc:
             logger.exception("Distribution download failed")
             await query.message.answer(f"❌ Не удалось отправить Excel: {exc}")
@@ -469,7 +471,7 @@ async def distribution_action(query: CallbackQuery):
             return
         await query.message.answer("Выберите кабинеты для загрузки:", reply_markup=admin_keyboard("distribution"))
     else:
-        await query.message.answer("Файлы отправлены. При необходимости можете выбрать загрузку на WB выше.")
+        await query.message.answer("Общий архив отправлен. При необходимости можете выбрать загрузку на WB выше.")
 
 
 @router.message(F.text == BTN_HISTORY)

@@ -10,7 +10,7 @@ import aiohttp
 
 from .config import Settings
 from .distributor import distribute_barcode
-from .excel_io import build_summary, read_input_excel, write_warehouse_files
+from .excel_io import build_summary, read_input_with_controls, write_warehouse_files
 from .history import cleanup_history, make_run_dir, write_json
 from .exclusions import create_exclusions_template, exclusions_count, read_exclusions, save_exclusions_template
 from .kits import read_kits_excel
@@ -367,7 +367,7 @@ class DistributionService:
         shutil.copy2(input_path, input_copy)
         output_dir = run_dir / "output"
 
-        stock, excluded_barcodes = read_input_excel(input_copy)
+        stock, excluded_barcodes, zero_kit_barcodes = read_input_with_controls(input_copy)
         kits: list[KitDefinition] = read_kits_excel(self.kits_path) if self.kits_path.exists() else []
         cabinet_exclusions = read_exclusions(
             self.exclusions_path,
@@ -441,6 +441,20 @@ class DistributionService:
         stock, excluded_roots, preferred_input_by_root, grouped_inputs = _normalize_stock_by_alias_group(
             stock, excluded_barcodes, alias_root
         )
+        kit_roots = {alias_root.get(kit.barcode, kit.barcode) for kit in kits}
+        zero_kit_roots = {alias_root.get(sku, sku) for sku in zero_kit_barcodes} - excluded_roots
+        unknown_zero_kits = zero_kit_roots - kit_roots
+        if unknown_zero_kits:
+            raise ValueError('Знак % указан для ШК, не найденных в шаблоне комплектов: '
+                             + ', '.join(sorted(unknown_zero_kits)))
+        for conflict in conflicts:
+            roots = {alias_root.get(sku, sku) for sku in conflict['skus']}
+            if roots & zero_kit_roots and roots - zero_kit_roots:
+                raise ValueError(f"Нельзя применить %: противоречивые ШК у chrtID {conflict['chrt_id']} "
+                                 f"в кабинете {conflict['cabinet']}")
+        stock = {sku: 0 if alias_root.get(sku, sku) in zero_kit_roots else qty
+                 for sku, qty in stock.items()}
+        ready_kit_roots = {alias_root.get(sku, sku) for sku, qty in stock.items() if qty > 0} & kit_roots
         variants_by_cabinet = _expand_variants_for_aliases(actual_variants_by_cabinet, alias_groups)
 
         merged_input_aliases = {
@@ -475,6 +489,8 @@ class DistributionService:
         no_sales_kits: list[str] = []
 
         for kit in kits:
+            if alias_root.get(kit.barcode, kit.barcode) in ready_kit_roots | zero_kit_roots:
+                continue
             # Если баркод комплекта помечен ! во входном файле, он полностью
             # ведётся вручную и бот не должен формировать/обнулять его.
             if alias_root.get(kit.barcode, kit.barcode) in excluded_roots:
@@ -659,6 +675,10 @@ class DistributionService:
             "not_found_kit_barcodes": not_found_kits,
             "excluded_barcodes": sorted(excluded_barcodes),
             "excluded_variant_groups": sorted(excluded_roots),
+            "zero_kit_barcodes": sorted(zero_kit_barcodes),
+            "zero_kit_variant_groups": sorted(zero_kit_roots),
+            "ready_kit_barcodes": sorted(kit.barcode for kit in kits
+                                         if alias_root.get(kit.barcode, kit.barcode) in ready_kit_roots),
             "cabinet_barcode_exclusions": {key: sorted(values) for key, values in cabinet_exclusions.items()},
             "merged_input_aliases": merged_input_aliases,
             "component_consumed_by_kits": dict(component_consumed),
