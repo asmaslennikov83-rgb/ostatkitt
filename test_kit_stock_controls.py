@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from zipfile import ZipFile
 
 import pytest
@@ -129,7 +130,10 @@ def test_zero_or_absent_kit_is_still_assembled(project, kit_row):
 
 
 def test_percent_writes_zero_in_all_warehouse_files(project):
+    date_before = datetime.now(timezone(timedelta(hours=3))).strftime('%d.%m.%Y')
     result = process(project, [('single', 80), ('kit', '%'), ('other_kit', '!')])
+    date_after = datetime.now(timezone(timedelta(hours=3))).strftime('%d.%m.%Y')
+    assert result['zip'].name in {f'Распределение_FBS_{date}.zip' for date in (date_before, date_after)}
     assert allocation(result, 'kit', 'kit_alias') == 0
     assert allocation(result, 'single') == 80
     assert result['report']['component_consumed_by_kits'] == {}
