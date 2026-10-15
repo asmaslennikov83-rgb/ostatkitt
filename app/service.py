@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import zipfile
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -15,6 +16,7 @@ from .history import cleanup_history, make_run_dir, write_json
 from .exclusions import create_exclusions_template, exclusions_count, read_exclusions, save_exclusions_template
 from .kits import read_kits_excel
 from .models import DistributionLine, KitDefinition, ProductVariant, Warehouse
+from .split_kits import apply_split_rules
 from .wb_api import WBClient, count_orders_by_variant_and_warehouse
 
 
@@ -441,6 +443,7 @@ class DistributionService:
         stock, excluded_roots, preferred_input_by_root, grouped_inputs = _normalize_stock_by_alias_group(
             stock, excluded_barcodes, alias_root
         )
+        kits = apply_split_rules(kits, stock, alias_root, raw_actual_variants_by_cabinet)
         kit_roots = {alias_root.get(kit.barcode, kit.barcode) for kit in kits}
         zero_kit_roots = {alias_root.get(sku, sku) for sku in zero_kit_barcodes} - excluded_roots
         unknown_zero_kits = zero_kit_roots - kit_roots
@@ -532,6 +535,7 @@ class DistributionService:
             for kit, _components, _sales in valid_kits
         }
         kit_component_by_sku = {kit.barcode: components for kit, components, _sales in valid_kits}
+        kit_batch_size_by_sku = {kit.barcode: kit.output_per_batch for kit, _components, _sales in valid_kits}
 
         # Alternate between singles and kits at each safety level. A kit's
         # minimum consumes its full BOM, including repeated component barcodes.
@@ -545,12 +549,12 @@ class DistributionService:
                 desired = level * len(kit_candidates_by_sku[kit.barcode])
                 missing = max(0, desired - kit_built[kit.barcode])
                 possible = min((remaining_stock.get(sku, 0) // count for sku, count in components.items()), default=0)
-                add = min(missing, possible)
-                if add:
-                    kit_built[kit.barcode] += add
+                batches = min((missing + kit.output_per_batch - 1) // kit.output_per_batch, possible)
+                if batches:
+                    kit_built[kit.barcode] += batches * kit.output_per_batch
                     for sku, count in components.items():
-                        remaining_stock[sku] -= add * count
-                        component_consumed[sku] += add * count
+                        remaining_stock[sku] -= batches * count
+                        component_consumed[sku] += batches * count
 
         # Phase 2: distribute the remaining physical components according to
         # actual 14-day demand in *component units*, not kit units. This gives
@@ -576,7 +580,10 @@ class DistributionService:
                 if all(remaining_stock.get(sku, 0) >= count for sku, count in components.items()):
                     # Do not build beyond the demand-based target except for
                     # the already guaranteed safety floor.
-                    if kit_built[kit.barcode] < max(sales, safety * len(kit_candidates_by_sku[kit.barcode])):
+                    target = max(sales, safety * len(kit_candidates_by_sku[kit.barcode]))
+                    target = ((target + kit.output_per_batch - 1) // kit.output_per_batch
+                              * kit.output_per_batch)
+                    if kit_built[kit.barcode] < target:
                         ratio = kit_built[kit.barcode] / sales
                         options.append((ratio, 1, kit.barcode, 'kit'))
             if not options:
@@ -586,7 +593,7 @@ class DistributionService:
                 remaining_stock[sku] -= 1
                 reserved_for_single[sku] += 1
             else:
-                kit_built[sku] += 1
+                kit_built[sku] += kit_batch_size_by_sku[sku]
                 for component, count in kit_component_by_sku[sku].items():
                     remaining_stock[component] -= count
                     component_consumed[component] += count
@@ -614,6 +621,10 @@ class DistributionService:
                 'possible_before_distribution': built_target,
                 'target_sets': built_target, 'built': built,
                 'components': dict(components),
+                'output_per_batch': kit.output_per_batch,
+                'batches': built // kit.output_per_batch,
+                'component_units_consumed': {sku: built // kit.output_per_batch * count
+                                             for sku, count in components.items()},
                 'allocations': {f'{k[0]}:{k[1]}': v for k, v in line.allocations.items() if v},
             })
 
@@ -697,7 +708,8 @@ class DistributionService:
         }
         write_json(run_dir / "report.json", report)
 
-        zip_path = run_dir / "Распределение_FBS.zip"
+        archive_date = datetime.now(timezone(timedelta(hours=3))).strftime('%d.%m.%Y')
+        zip_path = run_dir / f"Распределение_FBS_{archive_date}.zip"
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for path in files:
                 zf.write(path, arcname=path.name)

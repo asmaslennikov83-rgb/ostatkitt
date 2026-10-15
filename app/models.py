@@ -25,6 +25,7 @@ class KitDefinition:
     barcode: str
     components: tuple[str, ...]
     row_number: int
+    output_per_batch: int = 1
 
 
 @dataclass
