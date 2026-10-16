@@ -4,12 +4,14 @@ import asyncio
 import shutil
 import zipfile
 from collections import Counter
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
 
 from .config import Settings
+from .diagnostics import calculation_metadata, freeze_file, serialize_catalog, sku_diagnostics, write_archive_manifest
 from .distributor import distribute_barcode
 from .excel_io import build_summary, read_input_with_controls, write_warehouse_files
 from .history import cleanup_history, make_run_dir, write_json
@@ -363,16 +365,24 @@ class DistributionService:
         return component_barcode
 
     async def process(self, input_path: Path, user_id: int) -> dict:
+        started_at = datetime.now(timezone.utc).isoformat()
         cleanup_history(self.history_root, self.settings.retention_days)
         run_dir = make_run_dir(self.history_root, user_id)
         input_copy = run_dir / f"input{input_path.suffix.lower()}"
         shutil.copy2(input_path, input_copy)
         output_dir = run_dir / "output"
+        diagnostic_dir = run_dir / 'diagnostics'
+        freeze_file(input_copy, diagnostic_dir, input_copy.name)
+        kits_copy = freeze_file(self.kits_path, diagnostic_dir, 'kits_template.xlsx')
+        exclusions_copy = freeze_file(self.exclusions_path, diagnostic_dir, 'exclusions.xlsx')
+        stocks_template_copy = freeze_file(self.template_path, diagnostic_dir, 'stocks_template.xlsx')
 
         stock, excluded_barcodes, zero_kit_barcodes = read_input_with_controls(input_copy)
-        kits: list[KitDefinition] = read_kits_excel(self.kits_path) if self.kits_path.exists() else []
+        input_stock = dict(stock)
+        kits: list[KitDefinition] = read_kits_excel(kits_copy) if kits_copy.exists() else []
+        template_kits = [asdict(kit) for kit in kits]
         cabinet_exclusions = read_exclusions(
-            self.exclusions_path,
+            exclusions_copy,
             tuple(c.key for c in self.settings.cabinets),
             tuple(c.seller_id for c in self.settings.cabinets),
         )
@@ -393,20 +403,28 @@ class DistributionService:
         variants_by_cabinet: dict[str, dict[str, ProductVariant]] = {}
         counts_by_cabinet: dict[str, dict[tuple[int, int], int]] = {}
         diagnostic = {"cabinets": {}}
+        order_snapshot = {}
 
-        for cabinet, (whs, orders, catalog_tuple) in zip(self.settings.cabinets, results):
+        for cabinet, (whs, orders, catalog_tuple), client in zip(self.settings.cabinets, results, clients):
             by_barcode, by_chrt = catalog_tuple
             warehouses.extend(whs)
             variants_by_cabinet[cabinet.key] = by_barcode
             valid_ids = {w.warehouse_id for w in whs}
             counts = count_orders_by_variant_and_warehouse(orders, valid_ids)
             counts_by_cabinet[cabinet.key] = counts
+            order_snapshot[cabinet.key] = [
+                {key: order[key] for key in ('id', 'chrtId', 'warehouseId', 'createdAt', 'isCancel') if key in order}
+                for order in orders
+            ]
             diagnostic["cabinets"][cabinet.key] = {
                 "name": cabinet.name,
                 "warehouses": [{"id": w.warehouse_id, "name": w.name} for w in whs],
                 "orders_14d": len(orders),
                 "catalog_barcodes": len(by_barcode),
                 "catalog_variants": len(by_chrt),
+                "orders_counted": sum(counts.values()),
+                "orders_ignored": len(orders) - sum(counts.values()),
+                "orders_window": getattr(client, 'last_orders_query', {'exact_api_window_available': False}),
             }
 
         if not warehouses:
@@ -653,7 +671,7 @@ class DistributionService:
             kit_barcodes={kit.barcode for kit in kits},
         )
         files = write_warehouse_files(
-            self.template_path,
+            stocks_template_copy,
             output_dir,
             warehouses,
             lines,
@@ -701,12 +719,44 @@ class DistributionService:
                     "source_qty": line.source_qty,
                     "reserve_qty": line.reserve_qty,
                     "allocations": {f"{k[0]}:{k[1]}": v for k, v in line.allocations.items() if v},
+                    "distribution_details": line.distribution_details,
                 }
                 for line in lines
             ],
             "diagnostic": diagnostic,
         }
+        metadata = calculation_metadata(self.settings, started_at)
+        report['calculation'] = metadata
+        report['sku_diagnostics'] = sku_diagnostics(
+            set(input_stock) | set(excluded_barcodes) | {kit.barcode for kit in kits}
+            | {sku for catalog in raw_actual_variants_by_cabinet.values() for sku in catalog},
+            stock, alias_root, preferred_input_by_root, variants_by_cabinet, counts_by_cabinet,
+            warehouses, output_barcode_by_cabinet, lines, excluded_roots, zero_kit_roots, ready_kit_roots,
+            raw_actual_variants_by_cabinet,
+        )
+        snapshot = {
+            'calculation': metadata,
+            'cabinets': [{'key': cabinet.key, 'name': cabinet.name, 'seller_id': cabinet.seller_id}
+                         for cabinet in self.settings.cabinets],
+            'warehouses': [asdict(warehouse) for warehouse in warehouses],
+            'input_stock': input_stock, 'normalized_stock': stock,
+            'manual_exclusions': sorted(excluded_barcodes), 'zero_kit_barcodes': sorted(zero_kit_barcodes),
+            'template_kits': template_kits, 'effective_kits': [asdict(kit) for kit in kits],
+            'catalogs': serialize_catalog(raw_actual_variants_by_cabinet),
+            'effective_variants_by_barcode': {key: {sku: asdict(variant) for sku, variant in catalog.items()}
+                                               for key, catalog in variants_by_cabinet.items()},
+            'orders': order_snapshot,
+            'order_counts': {key: [{'chrt_id': chrt_id, 'warehouse_id': warehouse_id, 'count': count}
+                                   for (chrt_id, warehouse_id), count in counts.items()]
+                             for key, counts in counts_by_cabinet.items()},
+            'alias_root': alias_root, 'alias_groups': {key: sorted(value) for key, value in alias_groups.items()},
+            'output_barcodes': {key: sorted(value) for key, value in all_barcodes_by_cabinet.items()},
+            'output_barcode_map': output_barcode_by_cabinet,
+            'cabinet_exclusions': {key: sorted(value) for key, value in cabinet_exclusions.items()},
+        }
+        write_json(diagnostic_dir / 'calculation_snapshot.json', snapshot)
         write_json(run_dir / "report.json", report)
+        write_archive_manifest(diagnostic_dir, files, run_dir / 'report.json')
 
         archive_date = datetime.now(timezone(timedelta(hours=3))).strftime('%d.%m.%Y')
         zip_path = run_dir / f"Распределение_FBS_{archive_date}.zip"
@@ -714,6 +764,9 @@ class DistributionService:
             for path in files:
                 zf.write(path, arcname=path.name)
             zf.write(run_dir / "report.json", arcname="report.json")
+            for path in sorted(diagnostic_dir.iterdir()):
+                if path.is_file():
+                    zf.write(path, arcname=f'diagnostics/{path.name}')
 
         return {
             "run_dir": run_dir,

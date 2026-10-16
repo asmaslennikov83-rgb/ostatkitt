@@ -87,6 +87,42 @@ def _scarce_stock_order(candidates: list[tuple[Warehouse, int]]) -> list[tuple[W
     return result
 
 
+def _cabinet_quotas(candidates: list[tuple[Warehouse, int]], quantity: int, safety: int) -> dict[str, int]:
+    sales = defaultdict(int)
+    capacities = defaultdict(int)
+    for warehouse, orders in candidates:
+        sales[warehouse.cabinet_key] += orders
+        capacities[warehouse.cabinet_key] += safety
+    keys = sorted(sales)
+    quotas = {key: 0 for key in keys}
+    total_sales = sum(sales.values())
+    if total_sales == 0:
+        remaining = quantity
+        while remaining:
+            for key in keys:
+                if quotas[key] < capacities[key]:
+                    quotas[key] += 1
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+        return quotas
+    remainders = {}
+    for key in keys:
+        quotas[key], remainders[key] = divmod(quantity * sales[key], total_sales)
+    order = sorted(keys, key=lambda key: (-remainders[key], -sales[key], key))
+    for key in order[:quantity - sum(quotas.values())]:
+        quotas[key] += 1
+    if quantity >= len(keys):
+        for key in keys:
+            if quotas[key] == 0:
+                donors = [donor for donor in keys if quotas[donor] > 1]
+                donor = min(donors, key=lambda item: (
+                    -(quotas[item] * total_sales - quantity * sales[item]), -quotas[item], item))
+                quotas[donor] -= 1
+                quotas[key] = 1
+    return quotas
+
+
 
 def _enforce_minimum_presence(
     allocations: dict[tuple[str, int], int],
@@ -139,8 +175,6 @@ def distribute_barcode(
     safety_stock_per_warehouse: int = 4,
 ) -> DistributionLine:
     line = DistributionLine(barcode=barcode, source_qty=quantity)
-    if quantity <= 0:
-        return line
 
     candidates: list[tuple[Warehouse, int]] = []
     for wh in warehouses:
@@ -151,12 +185,50 @@ def distribute_barcode(
         sales = order_counts_by_cabinet.get(wh.cabinet_key, {}).get((variant.chrt_id, wh.warehouse_id), 0)
         candidates.append((wh, int(sales)))
 
+    safety_target = max(1, int(safety_stock_per_warehouse))
+    total_sales = sum(sales for _warehouse, sales in candidates)
+    line.distribution_details = {
+        'quantity_to_distribute': quantity,
+        'threshold': threshold,
+        'no_sales_target': no_sales_target,
+        'safety_stock_per_warehouse': safety_target,
+        'required_for_full_safety': safety_target * len(candidates),
+        'orders_total': total_sales,
+        'candidates': [{
+            'cabinet_key': warehouse.cabinet_key, 'cabinet_name': warehouse.cabinet_name,
+            'warehouse_id': warehouse.warehouse_id, 'warehouse_name': warehouse.name,
+            'chrt_id': barcode_variants_by_cabinet[warehouse.cabinet_key][barcode].chrt_id,
+            'orders': sales,
+        } for warehouse, sales in candidates],
+    }
+    if quantity <= 0:
+        line.distribution_details['rule'] = 'zero_quantity'
+        return line
+
     if not candidates:
+        line.distribution_details['rule'] = 'not_found'
         line.reserve_qty = quantity
         return line
 
     candidates.sort(key=_priority_key)
     allocations: dict[tuple[str, int], int] = {(wh.cabinet_key, wh.warehouse_id): 0 for wh, _ in candidates}
+
+    if quantity < safety_target * len(candidates) and len({wh.cabinet_key for wh, _sales in candidates}) > 1:
+        quotas = _cabinet_quotas(candidates, quantity, safety_target)
+        line.distribution_details['rule'] = 'cabinet_demand_deficit' if total_sales else 'cabinet_balanced_deficit'
+        line.distribution_details['cabinet_quotas'] = quotas
+        for cabinet_key, quota in quotas.items():
+            cabinet_line = distribute_barcode(
+                barcode, quota, [wh for wh, _sales in candidates if wh.cabinet_key == cabinet_key],
+                barcode_variants_by_cabinet, order_counts_by_cabinet,
+                max(threshold, quantity), no_sales_target, safety_target,
+            )
+            allocations.update(cabinet_line.allocations)
+            line.reserve_qty += cabinet_line.reserve_qty
+        line.allocations = allocations
+        return line
+
+    line.distribution_details['rule'] = 'safety_then_demand' if total_sales else 'safety_no_orders'
 
     # Если товара меньше, чем складов, нельзя дать по 1 шт. всем.
     # Сохраняем покрытие кабинетов и затем идём по спросу.
@@ -169,7 +241,6 @@ def distribute_barcode(
 
     # Страховой запас: стараемся равномерно поднять каждый склад до заданного
     # минимума (по умолчанию 4 шт.) ДО распределения по продажам.
-    safety_target = max(1, int(safety_stock_per_warehouse))
     remaining = quantity
     balanced = _balanced_no_sales_order(candidates)
 

@@ -36,6 +36,7 @@ class DistributionLine:
     reserve_qty: int = 0
     found_in_cabinets: set[str] = field(default_factory=set)
     is_kit: bool = False
+    distribution_details: dict = field(default_factory=dict)
 
 
 @dataclass

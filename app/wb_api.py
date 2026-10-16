@@ -71,6 +71,8 @@ class WBClient:
         now = datetime.now(timezone.utc)
         date_from = int((now - timedelta(days=days)).timestamp())
         date_to = int(now.timestamp())
+        self.last_orders_query = {'exact_api_window_available': True, 'lookback_days': days,
+                                  'dateFrom': date_from, 'dateTo': date_to}
         cursor = 0
         result: list[dict] = []
         seen_cursors: set[int] = set()
