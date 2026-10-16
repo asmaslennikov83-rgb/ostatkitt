@@ -141,7 +141,8 @@ def test_percent_writes_zero_in_all_warehouse_files(project):
         assert rows.get('kit', rows.get('kit_alias')) == 0
         assert 'other_kit' not in rows
     with ZipFile(result['zip']) as archive:
-        assert set(archive.namelist()) == {path.name for path in result['files']} | {'report.json'}
+        assert {path.name for path in result['files']} | {'report.json'} <= set(archive.namelist())
+        assert 'diagnostics/calculation_snapshot.json' in archive.namelist()
 
 
 def test_positive_alternative_kit_barcode_prevents_assembly(project):

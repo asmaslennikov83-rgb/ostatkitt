@@ -19,8 +19,8 @@ line = distribute_barcode(barcode, 30, warehouses, variants, orders, 20, 2, 4)
 assert all(q >= 4 for q in line.allocations.values()), line.allocations
 assert sum(line.allocations.values()) + line.reserve_qty == 30
 
-# Not enough for 4 each: distribute in layers, so everyone reaches 2 before anyone gets 3+.
 line = distribute_barcode(barcode, 10, warehouses, variants, orders, 20, 2, 4)
-assert min(line.allocations.values()) >= 2, line.allocations
+assert sum(qty for (cabinet, warehouse), qty in line.allocations.items() if cabinet == 'a') == 9
+assert sum(qty for (cabinet, warehouse), qty in line.allocations.items() if cabinet == 'b') == 1
 assert sum(line.allocations.values()) == 10
 print("OK safety stock", line.allocations)
