@@ -20,7 +20,7 @@ def snapshot_from(result):
 def test_archive_has_version_orders_inputs_templates_and_verified_hashes(project):
     result = process(project, [(FIRST_SOURCE, 200), (SECOND_SOURCE, 50)])
     snapshot = snapshot_from(result)
-    assert result['report']['calculation']['bot_version'] == '17.4'
+    assert result['report']['calculation']['bot_version'] == '17.5'
     assert snapshot['input_stock'][FIRST_SOURCE] == 200
     assert snapshot['calculation']['settings']['lookback_days'] == 14
     assert snapshot['template_kits'] and snapshot['effective_kits']
@@ -50,7 +50,7 @@ def test_every_distribution_can_be_repeated_using_only_snapshot(project):
         trace = line['distribution_details']
         repeated = distribute_barcode(line['barcode'], trace['quantity_to_distribute'], warehouses, variants,
                                       counts, trace['threshold'], trace['no_sales_target'],
-                                      trace['safety_stock_per_warehouse'])
+                                      trace['safety_stock_per_warehouse'], strict_demand=trace.get('strict_demand', False))
         assert line['allocations'] == {f'{key}:{warehouse}': amount
                                       for (key, warehouse), amount in repeated.allocations.items() if amount}
         assert line['reserve_qty'] == repeated.reserve_qty
