@@ -123,6 +123,21 @@ def _cabinet_quotas(candidates: list[tuple[Warehouse, int]], quantity: int, safe
     return quotas
 
 
+def _demand_shares(quantity: int, weights: dict) -> dict:
+    total = sum(weights.values())
+    if total == 0:
+        return {key: 0 for key in weights}
+    quantity = min(quantity, total)
+    shares = {}
+    remainders = {}
+    for key, weight in weights.items():
+        shares[key], remainders[key] = divmod(quantity * weight, total)
+    order = sorted(weights, key=lambda key: (-remainders[key], -weights[key], key))
+    for key in order[:quantity - sum(shares.values())]:
+        shares[key] += 1
+    return shares
+
+
 
 def _enforce_minimum_presence(
     allocations: dict[tuple[str, int], int],
@@ -173,6 +188,7 @@ def distribute_barcode(
     threshold: int,
     no_sales_target: int,
     safety_stock_per_warehouse: int = 4,
+    strict_demand: bool = False,
 ) -> DistributionLine:
     line = DistributionLine(barcode=barcode, source_qty=quantity)
 
@@ -190,9 +206,10 @@ def distribute_barcode(
     line.distribution_details = {
         'quantity_to_distribute': quantity,
         'threshold': threshold,
-        'no_sales_target': no_sales_target,
-        'safety_stock_per_warehouse': safety_target,
-        'required_for_full_safety': safety_target * len(candidates),
+        'no_sales_target': 0 if strict_demand else no_sales_target,
+        'safety_stock_per_warehouse': 0 if strict_demand else safety_target,
+        'required_for_full_safety': 0 if strict_demand else safety_target * len(candidates),
+        'strict_demand': strict_demand,
         'orders_total': total_sales,
         'candidates': [{
             'cabinet_key': warehouse.cabinet_key, 'cabinet_name': warehouse.cabinet_name,
@@ -212,6 +229,22 @@ def distribute_barcode(
 
     candidates.sort(key=_priority_key)
     allocations: dict[tuple[str, int], int] = {(wh.cabinet_key, wh.warehouse_id): 0 for wh, _ in candidates}
+
+    if strict_demand:
+        cabinet_weights = defaultdict(int)
+        for warehouse, orders in candidates:
+            cabinet_weights[warehouse.cabinet_key] += orders
+        quotas = _demand_shares(quantity, cabinet_weights)
+        for cabinet, quota in quotas.items():
+            weights = {warehouse.warehouse_id: orders for warehouse, orders in candidates
+                       if warehouse.cabinet_key == cabinet}
+            for warehouse, amount in _demand_shares(quota, weights).items():
+                allocations[cabinet, warehouse] = amount
+        line.allocations = allocations
+        line.reserve_qty = quantity - sum(allocations.values())
+        line.distribution_details['rule'] = 'strict_demand_only'
+        line.distribution_details['cabinet_quotas'] = quotas
+        return line
 
     if quantity < safety_target * len(candidates) and len({wh.cabinet_key for wh, _sales in candidates}) > 1:
         quotas = _cabinet_quotas(candidates, quantity, safety_target)

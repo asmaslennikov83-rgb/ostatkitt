@@ -9,6 +9,7 @@ import platform
 import shutil
 
 from .history import write_json
+from .inventory_priority import priority_rules
 from .version import APP_VERSION, REPORT_SCHEMA_VERSION
 
 
@@ -23,7 +24,7 @@ def freeze_file(source: Path, directory: Path, name: str) -> Path:
 def calculation_metadata(settings, started_at: str) -> dict:
     source_dir = Path(__file__).resolve().parent
     modules = ('version.py', 'distributor.py', 'service.py', 'models.py', 'kits.py',
-               'split_kits.py', 'excel_io.py', 'exclusions.py', 'wb_api.py', 'diagnostics.py')
+               'split_kits.py', 'excel_io.py', 'exclusions.py', 'wb_api.py', 'diagnostics.py', 'inventory_priority.py')
     return {
         'bot_version': APP_VERSION, 'report_schema_version': REPORT_SCHEMA_VERSION,
         'started_at_utc': started_at, 'finished_at_utc': datetime.now(timezone.utc).isoformat(),
@@ -32,6 +33,7 @@ def calculation_metadata(settings, started_at: str) -> dict:
             'lookback_days', 'no_sales_target', 'distribute_all_threshold', 'safety_stock_per_warehouse')},
         'order_count_definition': 'Количество FBS-сборочных заданий за период по chrtID и доступному складу; не выкупы.',
         'deficit_policy': 'cabinet_demand_then_warehouse_v1',
+        'inventory_priority': priority_rules(),
         'module_sha256': {name: sha256((source_dir / name).read_bytes()).hexdigest() for name in modules},
     }
 
