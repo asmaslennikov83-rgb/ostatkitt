@@ -189,6 +189,7 @@ def distribute_barcode(
     no_sales_target: int,
     safety_stock_per_warehouse: int = 4,
     strict_demand: bool = False,
+    warehouse_floors: dict[tuple[str, int], int] | None = None,
 ) -> DistributionLine:
     line = DistributionLine(barcode=barcode, source_qty=quantity)
 
@@ -229,6 +230,44 @@ def distribute_barcode(
 
     candidates.sort(key=_priority_key)
     allocations: dict[tuple[str, int], int] = {(wh.cabinet_key, wh.warehouse_id): 0 for wh, _ in candidates}
+
+    if warehouse_floors is not None:
+        floors = {key: amount for key, amount in warehouse_floors.items() if key in allocations}
+        remaining = quantity
+        for warehouse, _orders in candidates:
+            key = warehouse.cabinet_key, warehouse.warehouse_id
+            if key in floors and remaining:
+                allocations[key] = 1
+                remaining -= 1
+        weights = {(warehouse.cabinet_key, warehouse.warehouse_id):
+                   max(0, orders - allocations[warehouse.cabinet_key, warehouse.warehouse_id])
+                   for warehouse, orders in candidates}
+        shares = _demand_shares(remaining, weights)
+        for key, amount in shares.items():
+            allocations[key] += amount
+            remaining -= amount
+        if remaining and not strict_demand and total_sales:
+            weights = {(warehouse.cabinet_key, warehouse.warehouse_id): orders for warehouse, orders in candidates}
+            extras = {}
+            remainders = {}
+            for key, orders in weights.items():
+                extras[key], remainders[key] = divmod(remaining * orders, total_sales)
+            ranked = sorted(weights, key=lambda key: (-remainders[key], -weights[key], key))
+            for key in ranked[:remaining - sum(extras.values())]:
+                extras[key] += 1
+            for key, amount in extras.items():
+                allocations[key] += amount
+            remaining = 0
+        line.allocations = allocations
+        line.reserve_qty = remaining
+        line.distribution_details.update({
+            'rule': 'selected_safety_then_demand',
+            'warehouse_floors': {f'{key[0]}:{key[1]}': value for key, value in floors.items()},
+            'required_for_full_safety': sum(floors.values()),
+            'safety_stock_per_warehouse': 1,
+            'no_sales_target': 0,
+        })
+        return line
 
     if strict_demand:
         cabinet_weights = defaultdict(int)

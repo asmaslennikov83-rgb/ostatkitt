@@ -18,7 +18,7 @@ from .history import cleanup_history, make_run_dir, write_json
 from .exclusions import create_exclusions_template, exclusions_count, read_exclusions, save_exclusions_template
 from .kits import read_kits_excel
 from .models import DistributionLine, KitDefinition, ProductVariant, Warehouse
-from .inventory_priority import policy_roots, priority_rules
+from .inventory_priority import policy_roots, priority_rules, selected_floors
 from .split_kits import apply_split_rules
 from .wb_api import WBClient, count_orders_by_variant_and_warehouse
 
@@ -561,10 +561,27 @@ class DistributionService:
             return self._total_sales(sku, warehouses, variants_by_cabinet, counts_by_cabinet)
 
         single_demand = {sku: demand(sku) for sku in stock}
+        special_floors = {}
+        special_targets = {}
+        for sku in set(stock) | set(kit_candidates_by_sku):
+            root = alias_root.get(sku, sku)
+            if root not in priority_roots | strict_roots:
+                continue
+            candidates = []
+            for warehouse in self._candidate_warehouses(sku, warehouses, variants_by_cabinet):
+                variant = variants_by_cabinet[warehouse.cabinet_key][sku]
+                orders = counts_by_cabinet[warehouse.cabinet_key].get((variant.chrt_id, warehouse.warehouse_id), 0)
+                candidates.append((warehouse, orders))
+            floors = selected_floors(candidates, 3 if root in priority_roots else 1, root in strict_roots)
+            special_floors[sku] = floors
+            special_targets[sku] = sum(max(orders, floors.get((warehouse.cabinet_key, warehouse.warehouse_id), 0))
+                                       for warehouse, orders in candidates)
         kit_targets = {}
         for kit, _components, sales in valid_kits:
-            if alias_root.get(kit.barcode, kit.barcode) in strict_roots:
-                kit_targets[kit.barcode] = sales // kit.output_per_batch * kit.output_per_batch
+            if kit.barcode in special_targets:
+                target = special_targets[kit.barcode]
+                kit_targets[kit.barcode] = ((target + kit.output_per_batch - 1) // kit.output_per_batch
+                                           * kit.output_per_batch)
             else:
                 target = max(sales, safety * len(kit_candidates_by_sku[kit.barcode]))
                 kit_targets[kit.barcode] = ((target + kit.output_per_batch - 1) // kit.output_per_batch
@@ -576,46 +593,32 @@ class DistributionService:
                 remaining_stock[component] -= batches * count
                 component_consumed[component] += batches * count
 
-        priority_single_targets = {sku: max(single_demand[sku], safety * len(single_candidates[sku]))
-                                   for sku in stock if alias_root.get(sku, sku) in priority_roots}
+        priority_single_targets = {sku: len(special_floors[sku]) for sku in stock if sku in special_floors}
         priority_kits = [(kit, components, sales) for kit, components, sales in valid_kits
-                         if alias_root.get(kit.barcode, kit.barcode) in priority_roots]
-        for level in range(1, safety + 1):
-            for sku in sorted(priority_single_targets):
-                wanted = min(level * len(single_candidates[sku]), stock[sku])
-                additional = min(max(0, wanted - reserved_for_single[sku]), remaining_stock[sku])
-                reserved_for_single[sku] += additional
-                remaining_stock[sku] -= additional
-            for kit, components, sales in sorted(priority_kits, key=lambda row: (-row[2], row[0].row_number)):
-                missing = max(0, level * len(kit_candidates_by_sku[kit.barcode]) - kit_built[kit.barcode])
-                possible = min((remaining_stock.get(sku, 0) // count for sku, count in components.items()), default=0)
-                batches = min((missing + kit.output_per_batch - 1) // kit.output_per_batch, possible)
-                if batches:
-                    build_batches(kit.barcode, batches)
-        while True:
-            options = []
-            for sku, target in priority_single_targets.items():
-                if reserved_for_single[sku] < target and remaining_stock[sku] > 0 and single_candidates[sku]:
-                    options.append((reserved_for_single[sku] / max(1, single_demand[sku]), 0, sku))
-            for kit, components, sales in priority_kits:
-                if kit_built[kit.barcode] < kit_targets[kit.barcode] and all(
-                        remaining_stock.get(sku, 0) >= count for sku, count in components.items()):
-                    options.append((kit_built[kit.barcode] / max(1, sales), 1, kit.barcode))
-            if not options:
-                break
-            _ratio, kind, sku = min(options)
-            if kind == 0:
-                remaining_stock[sku] -= 1
-                reserved_for_single[sku] += 1
-            else:
-                build_batches(sku, 1)
+                         if kit.barcode in special_floors]
+        kit_floor_targets = {kit.barcode: ((len(special_floors[kit.barcode]) + kit.output_per_batch - 1)
+                                          // kit.output_per_batch * kit.output_per_batch)
+                             for kit, _components, _sales in priority_kits}
+        for sku in sorted(priority_single_targets, key=lambda sku: (alias_root.get(sku, sku) in strict_roots, sku)):
+            additional = min(priority_single_targets[sku], remaining_stock[sku])
+            reserved_for_single[sku] += additional
+            remaining_stock[sku] -= additional
+        for kit, components, sales in sorted(priority_kits, key=lambda row: (
+                alias_root.get(row[0].barcode, row[0].barcode) in strict_roots, -row[2], row[0].row_number)):
+            possible = min((remaining_stock.get(sku, 0) // count for sku, count in components.items()), default=0)
+            batches = min(kit_floor_targets[kit.barcode] // kit.output_per_batch, possible)
+            if batches:
+                build_batches(kit.barcode, batches)
         assembly_policy = {
             **priority_rules(),
             'priority_targets': {**priority_single_targets,
-                                 **{kit.barcode: kit_targets[kit.barcode] for kit, _components, _sales in priority_kits}},
+                                 **kit_floor_targets},
             'protected_before_other_kits': {**{sku: reserved_for_single[sku] for sku in priority_single_targets},
                                           **{kit.barcode: kit_built[kit.barcode] for kit, _components, _sales in priority_kits}},
             'kit_requested_targets': kit_targets,
+            'selected_warehouse_floors': {sku: {f'{key[0]}:{key[1]}': value for key, value in floors.items()}
+                                          for sku, floors in special_floors.items()},
+            'demand_targets_including_safety': special_targets,
         }
         assembly_policy['priority_shortfall'] = {
             sku: max(0, target - assembly_policy['protected_before_other_kits'].get(sku, 0))
@@ -626,14 +629,14 @@ class DistributionService:
         # minimum consumes its full BOM, including repeated component barcodes.
         for level in range(1, safety + 1):
             for sku in sorted(stock):
-                if alias_root.get(sku, sku) in strict_roots:
+                if sku in special_floors:
                     continue
                 required = min(level * len(single_candidates[sku]), stock[sku])
                 additional = min(max(0, required - reserved_for_single[sku]), remaining_stock[sku])
                 reserved_for_single[sku] += additional
                 remaining_stock[sku] -= additional
             for kit, components, sales in sorted(valid_kits, key=lambda x: (-x[2], x[0].row_number)):
-                if alias_root.get(kit.barcode, kit.barcode) in strict_roots:
+                if kit.barcode in special_floors:
                     continue
                 desired = level * len(kit_candidates_by_sku[kit.barcode])
                 missing = max(0, desired - kit_built[kit.barcode])
@@ -653,7 +656,7 @@ class DistributionService:
         while True:
             options: list[tuple[float, int, str, str]] = []
             for sku, qty in remaining_stock.items():
-                if alias_root.get(sku, sku) in strict_roots and reserved_for_single[sku] >= single_demand[sku]:
+                if sku in special_targets and reserved_for_single[sku] >= special_targets[sku]:
                     continue
                 if qty > 0 and single_candidates[sku] and single_demand[sku] > 0:
                     ratio = reserved_for_single[sku] / single_demand[sku]
@@ -688,25 +691,25 @@ class DistributionService:
                 no_sales_target=self.settings.no_sales_target,
                 safety_stock_per_warehouse=safety,
                 strict_demand=alias_root.get(kit.barcode, kit.barcode) in strict_roots,
+                warehouse_floors=special_floors.get(kit.barcode),
             )
             built = sum(line.allocations.values())
             line.source_qty = 0
-            line.reserve_qty = 0
             line.is_kit = True
             if built:
                 kit_lines.append(line)
             kit_report.append({
                 'barcode': kit.barcode, 'name': kit.name, 'sales_14d': sales,
                 'possible_before_distribution': built_target,
-                'target_sets': built_target, 'built': built,
+                'target_sets': built_target, 'built': built_target,
                 'components': dict(components),
                 'priority_class': ('hard_priority' if alias_root.get(kit.barcode, kit.barcode) in priority_roots
                                    else 'strict_demand' if alias_root.get(kit.barcode, kit.barcode) in strict_roots
                                    else 'normal'),
                 'requested_sets': kit_targets[kit.barcode],
                 'output_per_batch': kit.output_per_batch,
-                'batches': built // kit.output_per_batch,
-                'component_units_consumed': {sku: built // kit.output_per_batch * count
+                'batches': built_target // kit.output_per_batch,
+                'component_units_consumed': {sku: built_target // kit.output_per_batch * count
                                              for sku, count in components.items()},
                 'allocations': {f'{k[0]}:{k[1]}': v for k, v in line.allocations.items() if v},
             })
@@ -724,6 +727,7 @@ class DistributionService:
                 no_sales_target=self.settings.no_sales_target,
                 safety_stock_per_warehouse=safety,
                 strict_demand=alias_root.get(barcode, barcode) in strict_roots,
+                warehouse_floors=special_floors.get(barcode),
             )
             line.source_qty = original_qty
             single_lines.append(line)

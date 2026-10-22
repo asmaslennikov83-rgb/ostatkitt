@@ -6,10 +6,28 @@ def priority_rules() -> dict:
     return {
         'hard_priority': sorted(PRIORITY_BARCODES),
         'strict_demand': sorted(DEMAND_ONLY_BARCODES),
-        'protected_target': 'max(orders_for_period, safety_stock_per_warehouse * eligible_warehouses)',
-        'strict_target': 'orders_for_period_without_safety_stock',
+        'protected_target': 'one_included_unit_on_top_three_warehouses_per_cabinet',
+        'strict_target': 'orders_with_one_included_unit_on_top_selling_warehouse_per_cabinet',
+        'no_orders_fallback': 'selected_warehouses_in_one_available_cabinet',
         'period': 'configured_lookback_days',
     }
+
+
+def selected_floors(candidates: list, limit: int, selling_only: bool = False) -> dict:
+    by_cabinet = {}
+    for warehouse, orders in candidates:
+        by_cabinet.setdefault(warehouse.cabinet_key, []).append((warehouse, orders))
+    if not any(orders for _warehouse, orders in candidates) and by_cabinet:
+        cabinet = min(by_cabinet)
+        by_cabinet = {cabinet: by_cabinet[cabinet]}
+        selling_only = False
+    floors = {}
+    for rows in by_cabinet.values():
+        rows.sort(key=lambda item: (-item[1], item[0].warehouse_id))
+        eligible = [item for item in rows if item[1] > 0 or not selling_only]
+        for warehouse, _orders in eligible[:limit]:
+            floors[warehouse.cabinet_key, warehouse.warehouse_id] = 1
+    return floors
 
 
 def policy_roots(alias_root: dict[str, str], catalogs: dict) -> tuple[set[str], set[str]]:
