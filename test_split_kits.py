@@ -210,7 +210,7 @@ def test_no_orders_does_not_consume_unreported_pair_remainder(project):
     FakeWB.demand = {}
     FakeWB.warehouse_ids = (11,)
     result = process(project, [(FIRST_SOURCE, 100)])
-    assert allocation(result, FIRST_HALF) == 8
+    assert allocation(result, FIRST_HALF) == 2
     assert_first_pool_balanced(result, 100)
 
 

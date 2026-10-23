@@ -20,7 +20,7 @@ def snapshot_from(result):
 def test_archive_has_version_orders_inputs_templates_and_verified_hashes(project):
     result = process(project, [(FIRST_SOURCE, 200), (SECOND_SOURCE, 50)])
     snapshot = snapshot_from(result)
-    assert result['report']['calculation']['bot_version'] == '17.6'
+    assert result['report']['calculation']['bot_version'] == '17.7'
     assert snapshot['input_stock'][FIRST_SOURCE] == 200
     assert snapshot['calculation']['settings']['lookback_days'] == 14
     assert snapshot['template_kits'] and snapshot['effective_kits']

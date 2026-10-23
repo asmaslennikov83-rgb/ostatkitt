@@ -232,7 +232,7 @@ def test_ready_kit_uses_existing_single_distribution_rules(project, quantity):
         {cabinet.key: {'kit': ProductVariant(cabinet.key, ident, 2, ('kit',))}
          for cabinet, ident in zip(project.settings.cabinets, (2, 102))},
         {'cabinet_1': {(2, 11): 10, (2, 12): 10},
-         'cabinet_2': {(102, 11): 10, (102, 12): 10}}, 20, 2, 4)
+         'cabinet_2': {(102, 11): 10, (102, 12): 10}}, 20, 2, 1, balanced_safety=True)
     actual = next(line for line in result['report']['allocations'] if line['barcode'] == 'kit')
     assert actual['allocations'] == {f'{cabinet}:{warehouse}': amount
                                      for (cabinet, warehouse), amount in expected.allocations.items() if amount}
@@ -245,9 +245,9 @@ def test_ready_kit_without_orders_keeps_extra_in_reserve(project, monkeypatch):
         return []
     monkeypatch.setattr(FakeWB, 'get_orders', no_orders)
     result = process(project, [('single', 80), ('kit', 30), ('other_kit', '!')])
-    assert allocation(result, 'kit') == 16
+    assert allocation(result, 'kit') == 4
     actual = next(line for line in result['report']['allocations'] if line['barcode'] == 'kit')
-    assert actual['reserve_qty'] == 14
+    assert actual['reserve_qty'] == 26
     assert not result['report']['component_consumed_by_kits']
 
 
