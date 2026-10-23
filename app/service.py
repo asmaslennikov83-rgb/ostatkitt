@@ -18,7 +18,7 @@ from .history import cleanup_history, make_run_dir, write_json
 from .exclusions import create_exclusions_template, exclusions_count, read_exclusions, save_exclusions_template
 from .kits import read_kits_excel
 from .models import DistributionLine, KitDefinition, ProductVariant, Warehouse
-from .inventory_priority import policy_roots, priority_rules, selected_floors
+from .inventory_priority import policy_roots, priority_rules, spread_floors, balanced_floors
 from .split_kits import apply_split_rules
 from .wb_api import WBClient, count_orders_by_variant_and_warehouse
 
@@ -541,7 +541,7 @@ class DistributionService:
         # Phase 1: allocate the mandatory safety floor to singles and kits.
         # If a full floor is impossible, allocate whole units layer by layer;
         # never create a kit without all of its components.
-        safety = max(1, int(self.settings.safety_stock_per_warehouse))
+        safety = 1
         kit_lines: list[DistributionLine] = []
         kit_report: list[dict] = []
         component_consumed: Counter[str] = Counter()
@@ -563,17 +563,22 @@ class DistributionService:
         single_demand = {sku: demand(sku) for sku in stock}
         special_floors = {}
         special_targets = {}
-        for sku in set(stock) | set(kit_candidates_by_sku):
+        special_plans = {}
+        normal_floors = {}
+        for sku in sorted(set(stock) | set(kit_candidates_by_sku)):
             root = alias_root.get(sku, sku)
-            if root not in priority_roots | strict_roots:
-                continue
             candidates = []
             for warehouse in self._candidate_warehouses(sku, warehouses, variants_by_cabinet):
                 variant = variants_by_cabinet[warehouse.cabinet_key][sku]
                 orders = counts_by_cabinet[warehouse.cabinet_key].get((variant.chrt_id, warehouse.warehouse_id), 0)
                 candidates.append((warehouse, orders))
-            floors = selected_floors(candidates, 3 if root in priority_roots else 1, root in strict_roots)
-            special_floors[sku] = floors
+            if root not in priority_roots | strict_roots:
+                normal_floors[sku] = balanced_floors(candidates, len(candidates))
+                continue
+            special_plans[sku] = (candidates, 3 if root in priority_roots else 1, root in strict_roots)
+        special_floors = spread_floors(special_plans)
+        for sku, floors in special_floors.items():
+            candidates = special_plans[sku][0]
             special_targets[sku] = sum(max(orders, floors.get((warehouse.cabinet_key, warehouse.warehouse_id), 0))
                                        for warehouse, orders in candidates)
         kit_targets = {}
@@ -583,7 +588,7 @@ class DistributionService:
                 kit_targets[kit.barcode] = ((target + kit.output_per_batch - 1) // kit.output_per_batch
                                            * kit.output_per_batch)
             else:
-                target = max(sales, safety * len(kit_candidates_by_sku[kit.barcode]))
+                target = max(sales, len(normal_floors[kit.barcode]))
                 kit_targets[kit.barcode] = ((target + kit.output_per_batch - 1) // kit.output_per_batch
                                            * kit.output_per_batch)
 
@@ -619,6 +624,7 @@ class DistributionService:
             'selected_warehouse_floors': {sku: {f'{key[0]}:{key[1]}': value for key, value in floors.items()}
                                           for sku, floors in special_floors.items()},
             'demand_targets_including_safety': special_targets,
+            'general_safety': {'per_warehouse': 1, 'max_difference_percent_of_smaller': 15},
         }
         assembly_policy['priority_shortfall'] = {
             sku: max(0, target - assembly_policy['protected_before_other_kits'].get(sku, 0))
@@ -631,14 +637,14 @@ class DistributionService:
             for sku in sorted(stock):
                 if sku in special_floors:
                     continue
-                required = min(level * len(single_candidates[sku]), stock[sku])
+                required = min(len(normal_floors[sku]), stock[sku])
                 additional = min(max(0, required - reserved_for_single[sku]), remaining_stock[sku])
                 reserved_for_single[sku] += additional
                 remaining_stock[sku] -= additional
             for kit, components, sales in sorted(valid_kits, key=lambda x: (-x[2], x[0].row_number)):
                 if kit.barcode in special_floors:
                     continue
-                desired = level * len(kit_candidates_by_sku[kit.barcode])
+                desired = len(normal_floors[kit.barcode])
                 missing = max(0, desired - kit_built[kit.barcode])
                 possible = min((remaining_stock.get(sku, 0) // count for sku, count in components.items()), default=0)
                 batches = min((missing + kit.output_per_batch - 1) // kit.output_per_batch, possible)
@@ -692,11 +698,12 @@ class DistributionService:
                 safety_stock_per_warehouse=safety,
                 strict_demand=alias_root.get(kit.barcode, kit.barcode) in strict_roots,
                 warehouse_floors=special_floors.get(kit.barcode),
+                balanced_safety=kit.barcode not in special_floors,
             )
             built = sum(line.allocations.values())
             line.source_qty = 0
             line.is_kit = True
-            if built:
+            if built or line.reserve_qty:
                 kit_lines.append(line)
             kit_report.append({
                 'barcode': kit.barcode, 'name': kit.name, 'sales_14d': sales,
@@ -728,6 +735,7 @@ class DistributionService:
                 safety_stock_per_warehouse=safety,
                 strict_demand=alias_root.get(barcode, barcode) in strict_roots,
                 warehouse_floors=special_floors.get(barcode),
+                balanced_safety=barcode not in special_floors,
             )
             line.source_qty = original_qty
             single_lines.append(line)

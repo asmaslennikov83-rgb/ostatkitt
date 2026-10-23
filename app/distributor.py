@@ -4,6 +4,7 @@ import math
 from collections import defaultdict
 
 from .models import DistributionLine, ProductVariant, Warehouse
+from .inventory_priority import balanced_floors
 
 
 def _priority_key(item: tuple[Warehouse, int]) -> tuple[int, str, int]:
@@ -190,6 +191,7 @@ def distribute_barcode(
     safety_stock_per_warehouse: int = 4,
     strict_demand: bool = False,
     warehouse_floors: dict[tuple[str, int], int] | None = None,
+    balanced_safety: bool = False,
 ) -> DistributionLine:
     line = DistributionLine(barcode=barcode, source_qty=quantity)
 
@@ -231,6 +233,9 @@ def distribute_barcode(
     candidates.sort(key=_priority_key)
     allocations: dict[tuple[str, int], int] = {(wh.cabinet_key, wh.warehouse_id): 0 for wh, _ in candidates}
 
+    if balanced_safety:
+        warehouse_floors = balanced_floors(candidates, quantity)
+
     if warehouse_floors is not None:
         floors = {key: amount for key, amount in warehouse_floors.items() if key in allocations}
         remaining = quantity
@@ -266,6 +271,7 @@ def distribute_barcode(
             'required_for_full_safety': sum(floors.values()),
             'safety_stock_per_warehouse': 1,
             'no_sales_target': 0,
+            'balanced_safety': balanced_safety,
         })
         return line
 

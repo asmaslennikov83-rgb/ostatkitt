@@ -29,7 +29,7 @@ def calculation_metadata(settings, started_at: str) -> dict:
         'bot_version': APP_VERSION, 'report_schema_version': REPORT_SCHEMA_VERSION,
         'started_at_utc': started_at, 'finished_at_utc': datetime.now(timezone.utc).isoformat(),
         'python_version': platform.python_version(),
-        'settings': {key: getattr(settings, key) for key in (
+        'settings': {key: 1 if key == 'safety_stock_per_warehouse' else getattr(settings, key) for key in (
             'lookback_days', 'no_sales_target', 'distribute_all_threshold', 'safety_stock_per_warehouse')},
         'order_count_definition': 'Количество FBS-сборочных заданий за период по chrtID и доступному складу; не выкупы.',
         'deficit_policy': 'cabinet_demand_then_warehouse_v1',
