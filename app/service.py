@@ -624,7 +624,9 @@ class DistributionService:
             'selected_warehouse_floors': {sku: {f'{key[0]}:{key[1]}': value for key, value in floors.items()}
                                           for sku, floors in special_floors.items()},
             'demand_targets_including_safety': special_targets,
-            'general_safety': {'per_warehouse': 1, 'max_difference_percent_of_smaller': 15},
+            'general_safety': {'per_warehouse': 'dynamic_1_to_5_by_distributable_quantity_per_warehouse',
+                               'max_difference_percent_of_smaller': 15,
+                               'assembly_base_floor': 1},
         }
         assembly_policy['priority_shortfall'] = {
             sku: max(0, target - assembly_policy['protected_before_other_kits'].get(sku, 0))

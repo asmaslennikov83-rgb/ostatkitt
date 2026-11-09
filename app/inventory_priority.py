@@ -58,23 +58,34 @@ def spread_floors(plans: dict) -> dict:
     return result
 
 
-def balanced_floors(candidates: list, quantity: int) -> dict:
+def dynamic_minimum(quantity: int, warehouse_count: int) -> int:
+    if warehouse_count <= 0:
+        return 1
+    return min(5, max(1, (quantity // warehouse_count + 1) // 2))
+
+
+def balanced_floors(candidates: list, quantity: int, minimum: int = 1) -> dict:
     groups = {}
     for warehouse, orders in candidates:
         groups.setdefault(warehouse.cabinet_key, []).append((warehouse, orders))
     keys = sorted(groups)
     if len(keys) < 2:
-        quotas = {key: min(quantity, len(groups[key])) for key in keys}
+        quotas = {key: min(quantity, minimum * len(groups[key])) for key in keys}
     else:
         first, second = keys
-        choices = [(left, right) for left in range(len(groups[first]) + 1)
-                   for right in range(len(groups[second]) + 1)
+        choices = [(left, right) for left in range(min(quantity, minimum * len(groups[first])) + 1)
+                   for right in range(min(quantity, minimum * len(groups[second])) + 1)
                    if left + right <= quantity and 100 * abs(left - right) <= 15 * min(left, right)]
         left, right = max(choices, key=lambda pair: (sum(pair), -abs(pair[0] - pair[1]), pair[0]))
         quotas = {first: left, second: right}
-    return {(warehouse.cabinet_key, warehouse.warehouse_id): 1
-            for key, rows in groups.items()
-            for warehouse, _orders in sorted(rows, key=lambda item: (-item[1], item[0].warehouse_id))[:quotas[key]]}
+    floors = {}
+    for key, rows in groups.items():
+        base, remainder = divmod(quotas[key], len(rows))
+        for index, (warehouse, _orders) in enumerate(sorted(rows, key=lambda item: (-item[1], item[0].warehouse_id))):
+            amount = base + (index < remainder)
+            if amount:
+                floors[key, warehouse.warehouse_id] = amount
+    return floors
 
 
 def policy_roots(alias_root: dict[str, str], catalogs: dict) -> tuple[set[str], set[str]]:

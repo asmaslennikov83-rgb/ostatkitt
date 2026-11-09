@@ -15,6 +15,7 @@ from .service import DistributionService
 from .price_compare import build_price_comparison
 from .wb_api import WBApiError
 from .stock_ops import StockManager, StockOperationError
+from .version import APP_VERSION
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ BTN_EXCLUSIONS = "🚫 Исключения ШК"
 BTN_ROLLBACK = "↩️ Откатить загрузку"
 BTN_HISTORY = "📂 История загрузок"
 BTN_ZERO = "🛑 Аварийное обнуление FBS"
+BTN_VERSION = f"Версия сборки: v{APP_VERSION}"
 pending_runs: dict[int, dict] = {}
 user_modes: dict[int, str] = {}
 zero_selections: dict[int, dict] = {}
@@ -45,9 +47,11 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_EXCLUSIONS)],
             [KeyboardButton(text=BTN_ROLLBACK), KeyboardButton(text=BTN_HISTORY)],
             [KeyboardButton(text=BTN_ZERO)],
+            [KeyboardButton(text=BTN_VERSION)],
         ],
         resize_keyboard=True,
         is_persistent=True,
+        input_field_placeholder=f"Версия сборки: v{APP_VERSION}",
     )
 
 
@@ -145,11 +149,20 @@ async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
     await message.answer(
         "🟢 Бот Wildberries работает.\n\n"
+        f"Версия сборки: v{APP_VERSION}\n\n"
         f"{template_status()}\n"
         f"{exclusions_status()}\n\n"
         "Выберите действие в главном меню:",
         reply_markup=main_menu(),
     )
+
+
+@router.message(F.text == BTN_VERSION)
+async def show_version(message: Message):
+    if not allowed(message):
+        await message.answer("⛔ Доступ к боту запрещён.")
+        return
+    await message.answer(BTN_VERSION, reply_markup=main_menu())
 
 
 @router.message(F.text == BTN_DISTRIBUTE)

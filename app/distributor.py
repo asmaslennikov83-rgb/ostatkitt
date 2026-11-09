@@ -4,7 +4,7 @@ import math
 from collections import defaultdict
 
 from .models import DistributionLine, ProductVariant, Warehouse
-from .inventory_priority import balanced_floors
+from .inventory_priority import balanced_floors, dynamic_minimum
 
 
 def _priority_key(item: tuple[Warehouse, int]) -> tuple[int, str, int]:
@@ -234,16 +234,17 @@ def distribute_barcode(
     allocations: dict[tuple[str, int], int] = {(wh.cabinet_key, wh.warehouse_id): 0 for wh, _ in candidates}
 
     if balanced_safety:
-        warehouse_floors = balanced_floors(candidates, quantity)
+        warehouse_floors = balanced_floors(candidates, quantity, dynamic_minimum(quantity, len(candidates)))
 
     if warehouse_floors is not None:
         floors = {key: amount for key, amount in warehouse_floors.items() if key in allocations}
         remaining = quantity
-        for warehouse, _orders in candidates:
-            key = warehouse.cabinet_key, warehouse.warehouse_id
-            if key in floors and remaining:
-                allocations[key] = 1
-                remaining -= 1
+        for level in range(1, max(floors.values(), default=0) + 1):
+            for warehouse, _orders in candidates:
+                key = warehouse.cabinet_key, warehouse.warehouse_id
+                if floors.get(key, 0) >= level and remaining:
+                    allocations[key] += 1
+                    remaining -= 1
         weights = {(warehouse.cabinet_key, warehouse.warehouse_id):
                    max(0, orders - allocations[warehouse.cabinet_key, warehouse.warehouse_id])
                    for warehouse, orders in candidates}
@@ -269,7 +270,7 @@ def distribute_barcode(
             'rule': 'selected_safety_then_demand',
             'warehouse_floors': {f'{key[0]}:{key[1]}': value for key, value in floors.items()},
             'required_for_full_safety': sum(floors.values()),
-            'safety_stock_per_warehouse': 1,
+            'safety_stock_per_warehouse': dynamic_minimum(quantity, len(candidates)) if balanced_safety else 1,
             'no_sales_target': 0,
             'balanced_safety': balanced_safety,
         })
