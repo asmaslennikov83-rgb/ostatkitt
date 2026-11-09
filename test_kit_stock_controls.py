@@ -245,9 +245,9 @@ def test_ready_kit_without_orders_keeps_extra_in_reserve(project, monkeypatch):
         return []
     monkeypatch.setattr(FakeWB, 'get_orders', no_orders)
     result = process(project, [('single', 80), ('kit', 30), ('other_kit', '!')])
-    assert allocation(result, 'kit') == 4
+    assert allocation(result, 'kit') == 16
     actual = next(line for line in result['report']['allocations'] if line['barcode'] == 'kit')
-    assert actual['reserve_qty'] == 26
+    assert actual['reserve_qty'] == 14
     assert not result['report']['component_consumed_by_kits']
 
 

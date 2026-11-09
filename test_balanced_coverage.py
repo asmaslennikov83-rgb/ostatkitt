@@ -1,4 +1,4 @@
-from app.inventory_priority import balanced_floors, spread_floors
+from app.inventory_priority import balanced_floors, spread_floors, dynamic_minimum
 from app.distributor import distribute_barcode
 from app.models import Warehouse, ProductVariant
 
@@ -57,3 +57,45 @@ def test_reported_41_units_no_longer_leave_second_cabinet_with_one():
         assert sum(line.allocations.values()) + line.reserve_qty == quantity
     line = distribute_barcode('sku', 41, warehouses, variants, orders, 20, 2, balanced_safety=True)
     assert sum(value for (key, _warehouse), value in line.allocations.items() if key == 'b') >= 7
+
+
+def test_dynamic_thresholds_and_different_warehouse_counts():
+    for count in (1, 2, 7, 16, 25):
+        for quantity in range(400):
+            average = quantity / count
+            expected = 1 if average < 3 else 2 if average < 5 else 3 if average < 7 else 4 if average < 9 else 5
+            assert dynamic_minimum(quantity, count) == expected
+    assert dynamic_minimum(100, 0) == 1
+
+
+def test_dynamic_minima_conserve_stock_and_balance_cabinets():
+    for first, second in ((8, 8), (8, 7), (3, 8), (1, 0)):
+        rows = candidates(first, second)
+        for quantity in (0, 1, 47, 48, 79, 80, 111, 112, 143, 144, 160, 1000):
+            minimum = dynamic_minimum(quantity, len(rows))
+            floors = balanced_floors(rows, quantity, minimum)
+            assert sum(floors.values()) <= quantity
+            assert all(1 <= amount <= minimum for amount in floors.values())
+            if second:
+                left = sum(amount for (key, _warehouse), amount in floors.items() if key == 'a')
+                right = sum(floors.values()) - left
+                assert 100 * abs(left - right) <= 15 * min(left, right)
+
+
+def test_160_units_give_five_each_without_orders_and_keep_remainder():
+    rows = candidates(8, 8)
+    variants = {key: {'sku': ProductVariant(key, 1, 1, ('sku',))} for key in ('a', 'b')}
+    line = distribute_barcode('sku', 160, [warehouse for warehouse, _orders in rows],
+                              variants, {'a': {}, 'b': {}}, 20, 2, balanced_safety=True)
+    assert set(line.allocations.values()) == {5}
+    assert line.reserve_qty == 80
+    assert line.distribution_details['safety_stock_per_warehouse'] == 5
+
+
+def test_special_explicit_floors_do_not_grow_with_stock():
+    rows = candidates(8, 8)
+    variants = {key: {'sku': ProductVariant(key, 1, 1, ('sku',))} for key in ('a', 'b')}
+    line = distribute_barcode('sku', 160, [warehouse for warehouse, _orders in rows],
+                              variants, {'a': {}, 'b': {}}, 20, 2, warehouse_floors={('a', 0): 1})
+    assert sum(line.allocations.values()) == 1
+    assert line.reserve_qty == 159

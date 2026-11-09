@@ -38,6 +38,17 @@ def test_non_admin_can_download_but_not_upload(bot_module, tmp_path):
     assert 'только администратору' in request.message.answer.call_args.args[0]
 
 
+def test_main_menu_and_start_display_current_build(bot_module):
+    from app.version import APP_VERSION
+    assert any(button.text == f'Версия сборки: v{APP_VERSION}'
+               for row in bot_module.main_menu().keyboard for button in row)
+    message = SimpleNamespace(from_user=SimpleNamespace(id=123), answer=AsyncMock())
+    asyncio.run(bot_module.start(message))
+    assert f'Версия сборки: v{APP_VERSION}' in message.answer.call_args.args[0]
+    asyncio.run(bot_module.show_version(message))
+    assert message.answer.call_args.args[0] == f'Версия сборки: v{APP_VERSION}'
+
+
 @pytest.mark.parametrize('action, count', [('download', 1), ('upload', 0), ('both', 1)])
 def test_three_distribution_actions(bot_module, tmp_path, action, count):
     bot_module.pending_runs[123] = {'zip': tmp_path / 'run.zip', 'files': [tmp_path / 'warehouse.xlsx']}
