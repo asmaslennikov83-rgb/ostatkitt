@@ -93,13 +93,13 @@ def assert_balanced(result, quantity, source_barcodes=(SOURCE,)):
 def test_reported_216_source_stock_protects_selected_warehouses_and_meets_demand(project):
     result = process(project, [(SOURCE, 216)])
     protected = result['report']['assembly_policy']['protected_before_other_kits']
-    assert protected == {SOURCE: 6, HIGH_200: 6, HIGH_50: 6, LOW_300: 2, LOW_600: 1}
+    assert protected == {SOURCE: 6, HIGH_200: 6, HIGH_50: 6, LOW_300: 2, LOW_600: 2}
     assert allocation(result, SOURCE) >= 40
     assert reserve(result, SOURCE) == 0
     assert allocation(result, HIGH_200) == result['report']['assembly_policy']['kit_requested_targets'][HIGH_200]
     assert allocation(result, HIGH_50) >= 18
     assert allocation(result, LOW_300) == 8
-    assert allocation(result, LOW_600) == 2
+    assert allocation(result, LOW_600) == 3
     assert_balanced(result, 216)
 
 
@@ -142,20 +142,21 @@ def test_priority_target_is_not_lost_to_rounding_across_many_warehouses(project)
     result = process(project, [(SOURCE, 220)])
     assert allocation(result, SOURCE) >= 100
     assert reserve(result, SOURCE) == 0
-    assert allocation(result, LOW_300, LOW_600) == 10
+    assert allocation(result, LOW_300, LOW_600) == 11
     assert_balanced(result, 220)
 
 
-def test_no_orders_secondary_kits_have_one_fallback_in_one_cabinet(project):
+def test_no_orders_secondary_kits_have_one_in_each_cabinet(project):
     for cabinet in FakeWB.demand.values():
         cabinet[LOW_300] = (0,) * 6
         cabinet[LOW_600] = (0,) * 6
     result = process(project, [(SOURCE, 500)])
-    assert allocation(result, LOW_300) == allocation(result, LOW_600) == 1
+    assert allocation(result, LOW_300) == allocation(result, LOW_600) == 2
     for barcode in (LOW_300, LOW_600):
         line = next(line for line in result['report']['allocations'] if line['barcode'] == barcode)
-        assert sum(line['allocations'].values()) == 1
-        assert all(key.startswith('cabinet_1:') for key in line['allocations'])
+        assert sum(line['allocations'].values()) == 2
+        assert all(sum(value for key, value in line['allocations'].items() if key.startswith(cabinet + ':')) == 1
+                   for cabinet in ('cabinet_1', 'cabinet_2'))
     assert_balanced(result, 500)
 
 
@@ -163,9 +164,9 @@ def test_one_order_secondary_kit_is_only_on_the_ordered_warehouse(project):
     result = process(project, [(SOURCE, 216)])
     line = next(line for line in result['report']['allocations'] if line['barcode'] == LOW_600)
     assert line['allocations']['cabinet_1:2'] == 1
-    assert sum(line['allocations'].values()) == 2
+    assert sum(line['allocations'].values()) == 3
     assert line['distribution_details']['rule'] == 'selected_safety_then_demand'
-    assert line['distribution_details']['required_for_full_safety'] == 1
+    assert line['distribution_details']['required_for_full_safety'] == 2
 
 
 def test_ready_secondary_stock_is_capped_and_extra_stays_in_reserve(project):
@@ -174,8 +175,8 @@ def test_ready_secondary_stock_is_capped_and_extra_stays_in_reserve(project):
     result = process(project, [(SOURCE, 216), (LOW_300, 40), (LOW_600, 5)])
     assert allocation(result, LOW_300) == 8
     assert reserve(result, LOW_300) == 32
-    assert allocation(result, LOW_600) == 1
-    assert reserve(result, LOW_600) == 4
+    assert allocation(result, LOW_600) == 2
+    assert reserve(result, LOW_600) == 3
     assert not any(kit['barcode'] in (LOW_300, LOW_600) for kit in result['report']['kits'])
     assert_balanced(result, 216)
 
@@ -268,7 +269,7 @@ def test_archive_contains_priority_targets_and_replayable_strict_distributions(p
     with ZipFile(result['zip']) as archive:
         snapshot = json.loads(archive.read('diagnostics/calculation_snapshot.json'))
     assert snapshot['assembly_policy'] == result['report']['assembly_policy']
-    assert snapshot['assembly_policy']['kit_requested_targets'][LOW_600] == 2
+    assert snapshot['assembly_policy']['kit_requested_targets'][LOW_600] == 3
     warehouses = [Warehouse(**row) for row in snapshot['warehouses']]
     variants = {key: {sku: ProductVariant(**{**row, 'skus': tuple(row['skus'])})
                       for sku, row in catalog.items()}
@@ -335,7 +336,7 @@ def test_all_no_orders_have_only_selected_floors_and_preserve_split_remainder(pr
         line = next(line for line in result['report']['allocations'] if line['barcode'] == barcode)
         assert len(line['allocations']) == 3
         assert all(key.startswith('cabinet_1:') and value == 1 for key, value in line['allocations'].items())
-    assert allocation(result, LOW_300) == allocation(result, LOW_600) == 1
+    assert allocation(result, LOW_300) == allocation(result, LOW_600) == 2
     half = next(kit for kit in result['report']['kits'] if kit['barcode'] == HIGH_50)
     assert half['built'] == 4
     assert half['batches'] == 2
@@ -351,7 +352,7 @@ def test_priority_floors_do_not_seed_all_twelve_warehouses(project):
         assert all(sum(key.startswith(cabinet + ':') for key in floors[barcode]) == 3
                    for cabinet in ('cabinet_1', 'cabinet_2'))
     assert allocation(result, LOW_300) == 8
-    assert allocation(result, LOW_600) == 2
+    assert allocation(result, LOW_600) == 3
     assert_balanced(result, 167)
 
 
@@ -371,10 +372,11 @@ def test_october_22_orders_with_fourteen_warehouses_build_300_and_600(project, m
     }
     result = process(project, [(SOURCE, 167)])
     assert {barcode: allocation(result, barcode) for barcode in (SOURCE, HIGH_200, HIGH_50, LOW_300, LOW_600)} == {
-        SOURCE: 78, HIGH_200: 8, HIGH_50: 32, LOW_300: 13, LOW_600: 3}
+        SOURCE: 74, HIGH_200: 7, HIGH_50: 32, LOW_300: 13, LOW_600: 4}
     assert_balanced(result, 167)
     for barcode in (LOW_300, LOW_600):
         line = next(line for line in result['report']['allocations'] if line['barcode'] == barcode)
         for key, quantity in line['allocations'].items():
             cabinet, warehouse = key.split(':')
-            assert quantity == FakeWB.demand[cabinet][barcode][int(warehouse) - 1]
+            floor = line['distribution_details']['warehouse_floors'].get(key, 0)
+            assert quantity == max(floor, FakeWB.demand[cabinet][barcode][int(warehouse) - 1])

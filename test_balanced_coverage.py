@@ -15,18 +15,18 @@ def test_balanced_floors_all_sizes_and_stock_levels():
                 floors = balanced_floors(candidates(first, second), quantity)
                 left = sum(key[0] == 'a' for key in floors)
                 right = sum(key[0] == 'b' for key in floors)
-                assert 100 * abs(left - right) <= 15 * min(left, right)
+                assert quantity == 1 or 100 * abs(left - right) <= 15 * min(left, right)
                 assert left + right <= quantity
                 assert all(value == 1 for value in floors.values())
                 feasible = [(small, large) for small in range(first + 1) for large in range(second + 1)
                             if small + large <= quantity and 100 * abs(small - large) <= 15 * min(small, large)]
-                assert len(floors) == max(sum(pair) for pair in feasible)
+                assert len(floors) == (1 if quantity == 1 else max(sum(pair) for pair in feasible))
 
 
 def test_eight_and_seven_allowed_but_nine_and_seven_is_capped():
     assert len(balanced_floors(candidates(8, 7), 100)) == 15
     assert len(balanced_floors(candidates(9, 7), 100)) == 15
-    assert balanced_floors(candidates(3, 4), 1) == {}
+    assert balanced_floors(candidates(3, 4), 1) == {('a', 0): 1}
     assert len(balanced_floors(candidates(3, 4), 5)) == 4
 
 
@@ -79,7 +79,7 @@ def test_dynamic_minima_conserve_stock_and_balance_cabinets():
             if second:
                 left = sum(amount for (key, _warehouse), amount in floors.items() if key == 'a')
                 right = sum(floors.values()) - left
-                assert 100 * abs(left - right) <= 15 * min(left, right)
+                assert quantity == 1 or 100 * abs(left - right) <= 15 * min(left, right)
 
 
 def test_160_units_give_five_each_without_orders_and_keep_remainder():
@@ -99,3 +99,36 @@ def test_special_explicit_floors_do_not_grow_with_stock():
                               variants, {'a': {}, 'b': {}}, 20, 2, warehouse_floors={('a', 0): 1})
     assert sum(line.allocations.values()) == 1
     assert line.reserve_qty == 159
+
+
+def test_singleton_with_no_orders_is_listed_not_reserved():
+    rows = [(warehouse, 0) for warehouse, _orders in candidates(8, 8)]
+    variants = {key: {'sku': ProductVariant(key, 1, 1, ('sku',))} for key in ('a', 'b')}
+    line = distribute_barcode('sku', 1, [warehouse for warehouse, _orders in rows], variants,
+                              {'a': {}, 'b': {}}, 20, 2, balanced_safety=True)
+    assert sum(line.allocations.values()) == 1
+    assert line.reserve_qty == 0
+    assert line.distribution_details['singleton_balance_exception']
+
+
+def test_singleton_prefers_highest_demand_and_is_stable():
+    rows = candidates(2, 2)
+    rows[-1] = (rows[-1][0], 200)
+    assert balanced_floors(rows, 1) == {('b', 1): 1}
+    assert balanced_floors(list(reversed(rows)), 1) == {('b', 1): 1}
+
+
+def test_300_600_seed_both_cabinets_with_no_or_one_sided_orders():
+    for orders in (False, True):
+        rows = [(warehouse, int(orders and warehouse.cabinet_key == 'a'))
+                for warehouse, _orders in candidates(3, 4)]
+        floors = spread_floors({'300': (rows, 1, True), '600': (rows, 1, True)})
+        for selected in floors.values():
+            assert sum(key[0] == 'a' for key in selected) == 1
+            assert sum(key[0] == 'b' for key in selected) == 1
+
+
+def test_300_600_do_not_create_missing_cabinet():
+    floors = spread_floors({'600': (candidates(3, 0), 1, True)})
+    assert len(floors['600']) == 1
+    assert {key[0] for key in floors['600']} == {'a'}
