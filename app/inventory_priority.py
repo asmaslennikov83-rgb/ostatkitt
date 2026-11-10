@@ -7,8 +7,8 @@ def priority_rules() -> dict:
         'hard_priority': sorted(PRIORITY_BARCODES),
         'strict_demand': sorted(DEMAND_ONLY_BARCODES),
         'protected_target': 'three_warehouses_per_cabinet_coverage_before_orders',
-        'strict_target': 'orders_with_one_included_unit_on_top_selling_warehouse_per_cabinet',
-        'no_orders_fallback': 'selected_warehouses_in_one_available_cabinet',
+        'strict_target': 'orders_with_one_included_unit_in_every_available_cabinet',
+        'no_orders_fallback': 'three_sku_group_one_cabinet_300_600_every_cabinet',
         'period': 'configured_lookback_days',
     }
 
@@ -36,10 +36,8 @@ def spread_floors(plans: dict) -> dict:
     covered = {}
     for sku, (candidates, limit, selling_only) in sorted(plans.items()):
         cabinets = {warehouse.cabinet_key for warehouse, _orders in candidates}
-        if not any(orders for _warehouse, orders in candidates) and cabinets:
+        if not selling_only and not any(orders for _warehouse, orders in candidates) and cabinets:
             cabinets = {min(cabinets)}
-        elif selling_only:
-            cabinets = {warehouse.cabinet_key for warehouse, orders in candidates if orders}
         eligible[sku] = [(warehouse, orders) for warehouse, orders in candidates if warehouse.cabinet_key in cabinets]
     for level in range(max((plan[1] for plan in plans.values()), default=0)):
         for sku in sorted(plans, key=lambda key: (plans[key][1], key)):
@@ -65,6 +63,10 @@ def dynamic_minimum(quantity: int, warehouse_count: int) -> int:
 
 
 def balanced_floors(candidates: list, quantity: int, minimum: int = 1) -> dict:
+    if quantity == 1 and candidates:
+        warehouse, _orders = min(candidates, key=lambda item: (
+            -item[1], item[0].cabinet_key, item[0].warehouse_id))
+        return {(warehouse.cabinet_key, warehouse.warehouse_id): 1}
     groups = {}
     for warehouse, orders in candidates:
         groups.setdefault(warehouse.cabinet_key, []).append((warehouse, orders))

@@ -273,6 +273,8 @@ def distribute_barcode(
             'safety_stock_per_warehouse': dynamic_minimum(quantity, len(candidates)) if balanced_safety else 1,
             'no_sales_target': 0,
             'balanced_safety': balanced_safety,
+            'singleton_balance_exception': balanced_safety and quantity == 1
+                                           and len({warehouse.cabinet_key for warehouse, _orders in candidates}) > 1,
         })
         return line
 
