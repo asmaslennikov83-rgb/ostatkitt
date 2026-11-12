@@ -7,7 +7,7 @@ import app.stock_ops as stock_module
 from app.config import CabinetConfig, Settings
 from app.models import KitDefinition, ProductVariant, Warehouse
 from app.service import DistributionService
-from app.split_kits import SPLIT_KIT_SOURCES, apply_split_rules
+from app.split_kits import SPLIT_KIT_SOURCES, apply_split_rules, resolve_split_components
 from app.stock_ops import StockManager
 from test_kit_stock_controls import Session, allocation, process, warehouse_rows, workbook
 
@@ -16,6 +16,8 @@ FIRST_SOURCE = '4610231972418'
 FIRST_HALF = '2046819245780'
 SECOND_SOURCE = '4610231972241'
 SECOND_HALF = '2046819266549'
+PACK_150 = '2061510385436'
+PACK_250 = '2061511246934'
 
 
 class FakeWB:
@@ -30,7 +32,7 @@ class FakeWB:
         offset = 0 if self.cabinet.key == 'cabinet_1' else 100
         aliases = [(FIRST_SOURCE, 'source_alias'), (FIRST_HALF, 'half_alias'),
                    ('pack200',), ('pack300',), ('pack600',), (SECOND_SOURCE,), (SECOND_HALF,),
-                   ('mixed_kit',), ('other_component',)]
+                   ('mixed_kit',), ('other_component',), (PACK_150,), (PACK_250,)]
         variants = {offset + index: ProductVariant(self.cabinet.key, offset + index, index, skus)
                     for index, skus in enumerate(aliases, start=1)}
         if self.cabinet.key == 'cabinet_2':
@@ -81,6 +83,45 @@ def project(tmp_path, monkeypatch):
 def line_reserve(result, *barcodes):
     return sum(line['reserve_qty'] for line in result['report']['allocations']
                if line['barcode'] in barcodes)
+
+
+def write_retort_template(project):
+    workbook(project.kits_path, ['Название', 'баркод комплекта', 'баркод1', 'баркод2', 'баркод3'],
+             [('Retort A 150', PACK_150, SECOND_SOURCE, SECOND_HALF),
+              ('Retort A 250', PACK_250, SECOND_SOURCE, SECOND_SOURCE, SECOND_HALF)])
+
+
+def test_template_with_half_components_builds_from_whole_packs_without_double_counting(project):
+    write_retort_template(project)
+    result = process(project, [(SECOND_SOURCE, 160)])
+    assert allocation(result, PACK_150) == allocation(result, PACK_250) == 4
+    assert allocation(result, SECOND_HALF) == 40
+    kits = {row['barcode']: row for row in result['report']['kits']}
+    assert kits[PACK_150]['component_units_consumed'] == {SECOND_SOURCE: 6}
+    assert kits[PACK_250]['component_units_consumed'] == {SECOND_SOURCE: 10}
+    assert kits[PACK_150]['output_per_batch'] == kits[PACK_250]['output_per_batch'] == 2
+    assert (allocation(result, SECOND_SOURCE) + line_reserve(result, SECOND_SOURCE)
+            + result['report']['component_consumed_by_kits'][SECOND_SOURCE]) == 160
+
+
+@pytest.mark.parametrize('marker', ['!', '%'])
+def test_split_component_controls_are_not_bypassed(project, marker):
+    write_retort_template(project)
+    result = process(project, [(SECOND_SOURCE, 160), (SECOND_HALF, marker)])
+    assert allocation(result, PACK_150, PACK_250, SECOND_HALF) == 0
+
+
+def test_even_split_component_counts_and_aliases_need_no_extra_batch():
+    recipe = KitDefinition('two halves', PACK_150, ('half_alias', SECOND_HALF, SECOND_SOURCE), 2)
+    aliases = {'half_alias': SECOND_HALF}
+    effective, = resolve_split_components([recipe], {SECOND_SOURCE: 160}, aliases, set())
+    assert effective.components == (SECOND_SOURCE,) * 2
+    assert effective.output_per_batch == 1
+
+
+def test_physical_half_inventory_keeps_original_template_recipe():
+    recipe = KitDefinition('150', PACK_150, (SECOND_SOURCE, SECOND_HALF), 2)
+    assert resolve_split_components([recipe], {SECOND_SOURCE: 160, SECOND_HALF: 10}, {}, set()) == [recipe]
 
 
 def assert_first_pool_balanced(result, source_qty):
