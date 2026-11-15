@@ -19,7 +19,7 @@ from .exclusions import create_exclusions_template, exclusions_count, read_exclu
 from .kits import read_kits_excel
 from .models import DistributionLine, KitDefinition, ProductVariant, Warehouse
 from .inventory_priority import policy_roots, priority_rules, spread_floors, balanced_floors
-from .split_kits import apply_split_rules
+from .split_kits import apply_split_rules, resolve_split_components
 from .wb_api import WBClient, count_orders_by_variant_and_warehouse
 
 
@@ -478,6 +478,7 @@ class DistributionService:
         stock = {sku: 0 if alias_root.get(sku, sku) in zero_kit_roots else qty
                  for sku, qty in stock.items()}
         ready_kit_roots = {alias_root.get(sku, sku) for sku, qty in stock.items() if qty > 0} & kit_roots
+        kits = resolve_split_components(kits, stock, alias_root, excluded_roots | zero_kit_roots)
         variants_by_cabinet = _expand_variants_for_aliases(actual_variants_by_cabinet, alias_groups)
 
         merged_input_aliases = {
