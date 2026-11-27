@@ -721,7 +721,7 @@ async def stock_execute(query: CallbackQuery):
         return
     ident = query.data.split(":")[-1]
     await query.answer()
-    status = await query.message.answer("⏳ Обновляю остатки WB и проверяю результат…")
+    status = await query.message.answer("⏳ Обновляю остатки WB и проверяю результат. При задержке WB повторяю только чтение остатков…")
     try:
         record = await stock_manager.execute(ident, user_id)
         text = (f"{'✅' if record['status'] == 'verified' else '⚠️'} Операция: {record['status']}\n"
@@ -729,6 +729,15 @@ async def stock_execute(query: CallbackQuery):
                 f"Ошибок: {sum(len(v) if isinstance(v, list) else 1 for v in record['errors'].values())}\n"
                 "Резервная копия и журнал сохранены в data/stock_operations/records.")
         await status.edit_text(text)
+        verification = record.get('verification_summary', {})
+        if verification:
+            await query.message.answer(
+                f"Проверка WB: подтверждено {verification.get('confirmed', 0)}; "
+                f"пока прежний остаток {verification.get('still_before', 0)}; "
+                f"другое значение {verification.get('different', 0)}; "
+                f"не удалось прочитать {verification.get('unavailable', 0)}; "
+                f"не отправлено {verification.get('not_sent', 0)}.\n"
+                "Повторные проверки не отправляют остатки заново.")
         await query.message.answer_document(FSInputFile(stock_manager._record_path(ident),
                                                         filename=f"WB_result_{ident[:10]}.json"),
                                             caption="Результат и резервная копия (включая ошибки)")

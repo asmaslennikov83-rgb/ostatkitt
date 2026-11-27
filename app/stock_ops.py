@@ -26,6 +26,9 @@ class StockOperationError(RuntimeError):
     pass
 
 
+VERIFICATION_DELAYS = (2, 5, 10, 20)
+
+
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -357,12 +360,38 @@ class StockManager:
                     raise StockOperationError('Появилась новая загрузка; сделайте новый предпросмотр отката')
             record = dict(preview)
             record.update({'status': 'started', 'started_at': utcnow(), 'after': {},
-                           'applied': {}, 'errors': {}, 'finished_at': None})
+                           'applied': {}, 'errors': {}, 'finished_at': None,
+                           'verification_attempts': {}, 'verification_status': {},
+                           'verification_delays_seconds': list(VERIFICATION_DELAYS)})
             # Record before ANY PUT so backups survive restarts and partial failure.
             _save(self._record_path(ident), record)
             async with aiohttp.ClientSession() as session:
                 clients = {cab.key: WBClient(cab, session)
                            for cab in self._cabinets(set(preview['cabinets']))}
+                pending = {}
+
+                async def verify(key, chunk):
+                    cab, warehouse = key.split(':')
+                    attempt = {'checked_at': utcnow()}
+                    try:
+                        actual = await clients[cab].get_fbs_stocks(int(warehouse), chunk)
+                        attempt['values'] = {str(chrt): actual[chrt] for chrt in chunk}
+                        for chrt, qty in chunk.items():
+                            ident_string = str(chrt)
+                            value = actual[chrt]
+                            record['after'][key][ident_string] = value
+                            state = ('confirmed' if value == qty else
+                                     'still_before' if value == before[key][chrt] else 'different')
+                            record['verification_status'][key][ident_string] = state
+                            if state == 'confirmed':
+                                record['applied'][key].append(ident_string)
+                                pending[key].pop(chrt, None)
+                    except Exception as exc:
+                        attempt['error'] = str(exc)
+                        for chrt in chunk:
+                            record['verification_status'][key][str(chrt)] = 'unavailable'
+                    record['verification_attempts'].setdefault(key, []).append(attempt)
+                    _save(self._record_path(ident), record)
                 # Abort entire operation if WB has changed since preview.
                 try:
                     for key, expected in before.items():
@@ -382,8 +411,10 @@ class StockManager:
                 for key, desired in targets.items():
                     cab, warehouse = key.split(':')
                     changed = {chrt: qty for chrt, qty in desired.items() if before[key][chrt] != qty}
-                    record['after'][key] = {str(chrt): qty for chrt, qty in changed.items()}
+                    record['after'][key] = {}
                     record['applied'][key] = []
+                    record['verification_status'][key] = {str(chrt): 'not_sent' for chrt in changed}
+                    pending[key] = {}
                     _save(self._record_path(ident), record)
                     for chunk in _chunks(changed):
                         sent_or_uncertain = False
@@ -402,17 +433,21 @@ class StockManager:
                         if not sent_or_uncertain:
                             _save(self._record_path(ident), record)
                             continue
-                        try:
-                            actual = await clients[cab].get_fbs_stocks(int(warehouse), chunk)
-                            for chrt, qty in chunk.items():
-                                if actual[chrt] == qty:
-                                    record['applied'][key].append(str(chrt))
-                                else:
-                                    record['errors'].setdefault(key, []).append(
-                                        f'chrtID {chrt}: ожидалось {qty}, WB вернул {actual[chrt]}')
-                        except Exception as exc:
-                            record['errors'].setdefault(key, []).append(f'Не удалось проверить: {exc}')
-                        _save(self._record_path(ident), record)
+                        pending[key].update(chunk)
+                        await verify(key, chunk)
+                for delay in VERIFICATION_DELAYS:
+                    if not any(pending.values()):
+                        break
+                    await asyncio.sleep(delay)
+                    for key, rows in pending.items():
+                        for chunk in _chunks(dict(rows)):
+                            await verify(key, chunk)
+                for key, rows in pending.items():
+                    for chrt, qty in rows.items():
+                        value = record['after'][key].get(str(chrt))
+                        state = record['verification_status'][key][str(chrt)]
+                        record['errors'].setdefault(key, []).append(
+                            f'chrtID {chrt}: ожидалось {qty}, последний остаток WB {value}; {state}')
             expected_count = sum(sum(1 for chrt, qty in rows.items() if before[key][chrt] != qty)
                                  for key, rows in targets.items())
             verified = sum(len(ids) for ids in record['applied'].values())
@@ -420,6 +455,8 @@ class StockManager:
                                 else 'partial')
             record['verified_count'] = verified
             record['expected_count'] = expected_count
+            record['verification_summary'] = dict(Counter(
+                state for rows in record['verification_status'].values() for state in rows.values()))
             record['finished_at'] = utcnow()
             _save(self._record_path(ident), record)
             self.active_previews.pop(actor, None)
